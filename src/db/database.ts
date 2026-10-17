@@ -33,6 +33,16 @@ export function migrate(db: Database, migrations: readonly Migration[] = MIGRATI
       `Database schema version ${current} is newer than this build supports (${latest}). Upgrade t3-fleet-gateway.`,
     );
   }
+  // Fork builds before this sync used versions 9 and 10 as no-op launch-spec barriers. v0.1.9 uses
+  // those same numbers for webhook tables. A ledger at 9+ without those tables must not skip ahead.
+  if (current >= 9 && !db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'webhook_subscriptions'").get()) {
+    throw new GatewayError(
+      'database_error',
+      `Database schema version ${current} has no webhook tables. A pre-merge fork build used versions 9 and 10 as launch-spec barriers, while v0.1.9 uses them for outbound webhooks. ` +
+        `Stop every gateway process, open this database, and run PRAGMA user_version = 8, then start this build so migrations 9 and 10 can create the webhook tables. ` +
+        `Job rows are left in place. The database is unchanged (schema version ${current}).`,
+    );
+  }
   let applied = current;
   for (const migration of migrations) {
     if (migration.version <= current) continue;

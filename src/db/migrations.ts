@@ -309,6 +309,14 @@ ALTER TABLE webhook_subscriptions ADD COLUMN last_test_outcome TEXT;
 ALTER TABLE webhook_subscriptions ADD COLUMN last_test_status_code INTEGER;
 `,
   },
+  {
+    version: 11,
+    name: 'workspace launch spec compatibility barrier',
+    // Older builds interpret an unknown launch_spec as NULL and could launch scratch work in a
+    // worktree. Their schema-version check must reject this ledger before reading v2 records.
+    // Versions 9 and 10 belong to the webhook schema, so this barrier follows them.
+    sql: 'SELECT 1;',
+  },
 ];
 
 /**
