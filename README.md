@@ -4,7 +4,7 @@
 
 Ask your bot to get something done. Let [T3 Code](https://github.com/pingdotgg/t3code) do the coding on your machines.
 
-T3 Fleet Gateway connects Grok Bot, Notion and other MCP clients to your T3 servers through one connection. Your agent can find projects, start work, answer worker questions and bring back the result. Each new job gets a T3 thread and its own git worktree and branch; you can open the thread in T3 whenever you want.
+T3 Fleet Gateway connects Grok Bot, Notion and other MCP clients to your T3 servers through one connection. Your agent can find projects, start work, answer worker questions and bring back the result. Each new job gets a T3 thread. Named projects use a fresh git worktree and branch; an optional machine default sends work with no named project to T3's internal scratch workspace, shown as "No project". You can open the thread in T3 whenever you want.
 
 ![A bot connects to one gateway, which routes coding work to T3 projects on several machines.](docs/images/architecture.svg)
 
@@ -139,6 +139,12 @@ and the models and reasoning efforts it offers. For my next job in
 ```
 
 Browsing and launching are separate choices. To launch into projects without aliases, explicitly enable that host's discovery launch policy. Existing aliases keep their restrictions; model choices must match what T3 advertises. [Discovery settings](docs/configuration.md#discovery).
+
+## Work without a project
+
+Configure a scratch alias with `workspaceMode: "scratch"` and the verified ID of the machine's internal T3 scratch project. Set the host's `defaultProject` to that alias and enable discovery. The [configuration guide](docs/configuration.md#no-named-project) includes an example and upgrade instructions.
+
+When the user names no project, the agent passes `target: { host: "machine-a" }` to `work_start`. An explicit project still uses its alias or project ID. An unknown named project must be resolved rather than sent to scratch. Existing aliases keep their worktree behavior unless explicitly changed.
 
 ## Keep a coordinator in the loop
 
