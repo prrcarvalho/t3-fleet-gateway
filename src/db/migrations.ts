@@ -317,6 +317,12 @@ ALTER TABLE webhook_subscriptions ADD COLUMN last_test_status_code INTEGER;
     // Versions 9 and 10 belong to the webhook schema, so this barrier follows them.
     sql: 'SELECT 1;',
   },
+  {
+    version: 12,
+    name: 'automatic workspace launch specs',
+    // A build that understands v2 scratch specs but not v3 workspace specs must refuse this ledger.
+    sql: 'SELECT 1;',
+  },
 ];
 
 /**
