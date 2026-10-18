@@ -233,8 +233,9 @@ describe('outbound job webhooks through MCP, watcher and HTTP', () => {
     await h.deliver();
     assert.equal(sink.received.length, 2);
     const early = sink.received.find((entry) => entry.payload.jobId === queued.jobId)!.payload;
+    // Named launches record the T3 project before queueing. The thread still does not exist.
     assert.deepEqual([early.type, early.previousState, early.threadId, early.link, early.projectId, early.turnInitiator],
-      ['cancelled', 'queued', null, null, null, { kind: 'unknown', clientId: null }]);
+      ['cancelled', 'queued', null, null, 'project-1', { kind: 'unknown', clientId: null }]);
     const running = sink.received.find((entry) => entry.payload.jobId === active.jobId)!.payload;
     assert.deepEqual([running.type, running.state, running.previousState], ['cancelled', 'cancelled', 'cancel_requested']);
     await h.deliver();

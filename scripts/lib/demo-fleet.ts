@@ -11,6 +11,7 @@ import { createServer as createHttpServer } from 'node:http';
 import { connect as tcpConnect, createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { parseConfig } from '../../src/config.ts';
 import { pkceChallenge, randomToken } from '../../src/crypto.ts';
@@ -202,15 +203,18 @@ export async function startDemoFleet(options: DemoOptions): Promise<DemoFleet> {
   };
   const door = await frontDoor();
   const mcpUrl = `http://127.0.0.1:${door.port}`;
+  // Named launches inspect the destination before queueing. The fake projects are not real checkouts, so the
+  // demo uses the same synthetic probe the job tests use.
+  const workspaceProbeCommand = [process.execPath, fileURLToPath(new URL('../../test/helpers/workspaceProbe.js', import.meta.url))];
   const config = parseConfig({
     publicUrl: mcpUrl,
     listen: { host: '127.0.0.1', port: door.port },
     hosts: [
-      { id: 'studio', label: 'Studio Mac mini', transportNote: 'Same machine', t3Url: fakes.studio.url, mintPairingCode: fakes.studio.mintCommand(), access: 'full-access', maxConcurrentJobs: 3,
+      { id: 'studio', label: 'Studio Mac mini', transportNote: 'Same machine', t3Url: fakes.studio.url, mintPairingCode: fakes.studio.mintCommand(), workspaceProbeCommand, access: 'full-access', maxConcurrentJobs: 3,
         discovery: { enabled: true, allowWorkStart: false } },
-      { id: 'forge', label: 'Forge workstation', transportNote: 'SSH tunnel', t3Url: fakes.forge.url, mintPairingCode: fakes.forge.mintCommand(), access: 'full-access', maxConcurrentJobs: 2,
+      { id: 'forge', label: 'Forge workstation', transportNote: 'SSH tunnel', t3Url: fakes.forge.url, mintPairingCode: fakes.forge.mintCommand(), workspaceProbeCommand, access: 'full-access', maxConcurrentJobs: 2,
         discovery: { enabled: true, allowWorkStart: true, runtimeMode: 'approval-required' } },
-      { id: 'lab', label: 'Lab VM', transportNote: 'Tailnet', t3Url: fakes.lab.url, mintPairingCode: fakes.lab.mintCommand(), access: 'auto', maxConcurrentJobs: 1 },
+      { id: 'lab', label: 'Lab VM', transportNote: 'Tailnet', t3Url: fakes.lab.url, mintPairingCode: fakes.lab.mintCommand(), workspaceProbeCommand, access: 'auto', maxConcurrentJobs: 1 },
     ],
     projects: [
       { alias: 'atlas-web', description: 'Customer web app', host: 'studio', t3ProjectId: 'project-1', runtimeMode: 'full-access' },
