@@ -160,7 +160,7 @@ Host-only starts use the scratch alias's permissions and model defaults. They do
 
 Scratch defaults advance the ledger to schema version 11, and automatic workspace selection to schema version 12. Migrations 9 and 10 are the v0.1.8 and v0.1.9 webhook schema; migrations 11 and 12 change no rows. Migration 11 makes older builds, including v0.1.9, refuse a ledger that can hold v2 scratch launch specs. Migration 12 makes a build that understands v2 but not v3 workspace specs refuse the ledger. Stop older gateway processes before upgrading. Older builds refuse the upgraded ledger; downgrading requires a pre-upgrade ledger backup. The migrations preserve existing jobs, credentials and webhook rows.
 
-A data directory already opened by a pre-merge fork build (`codex/projectless-default` or `codex/automatic-workspace-selection`) can show schema version 9 or 10 with no webhook tables, because those builds used 9 and 10 as this barrier. This build refuses that ledger and leaves it unchanged. Stop the gateway, back up the database, set `PRAGMA user_version = 8`, and start this build. Migrations 9 and 10 then create the webhook tables, and migration 11 applies the barrier. Job rows stay.
+A data directory already opened by a pre-merge fork build (`codex/projectless-default` or `codex/automatic-workspace-selection`) can show schema version 9 or 10 with no webhook tables, because those builds used 9 and 10 as these barriers. This build refuses that ledger and leaves it unchanged. Stop the gateway, back up the database, set `PRAGMA user_version = 8`, and start this build. Migrations 9 and 10 then create the webhook tables, and migrations 11 and 12 apply the launch-spec barriers. Job rows stay.
 
 #### Models
 
