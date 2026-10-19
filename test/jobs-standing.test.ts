@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, test } from 'node:test';
+import { describe, test, type TestContext } from 'node:test';
 import { runCli } from '../src/cli/main.ts';
+import { openDataDir } from '../src/dataDir.ts';
+import { openDatabase } from '../src/db/database.ts';
+import { OPEN_STATES } from '../src/jobs/states.ts';
+import { JobStore, type NewAdoptedJob } from '../src/jobs/store.ts';
+import { silentLogger } from '../src/log.ts';
 import { MINUTE } from '../src/time.ts';
 import type { FakeT3 } from './helpers/fakeT3.ts';
 import { assertNotLogged, connectAgent, jobState, startJob, startJobHarness, type Agent, type JobHarness } from './helpers/jobs.ts';
@@ -49,6 +54,29 @@ function coordinatorThread(fake: FakeT3, projectId = 'project-1'): string {
 
 async function adopt(harness: JobHarness, threadId: string, project = 'pilot', title?: string) {
   return harness.gw.services.jobs.adopt({ project, threadId, ...(title === undefined ? {} : { title }) });
+}
+
+/**
+ * The ledger as the `jobs adopt` CLI holds it: its own connection to the gateway's database. Where the CLI waits for a
+ * write lock the gateway holds, this one fails at once (`busy_timeout` 0), so a test can try again once the gateway is done.
+ */
+function cliLedger(t: TestContext, harness: JobHarness): JobStore {
+  const db = openDatabase(openDataDir(harness.gw.dataDir).databasePath);
+  db.exec('PRAGMA busy_timeout = 0');
+  t.after(() => db.close());
+  return new JobStore(db, harness.gw.clock, silentLogger);
+}
+
+/** The standing job `jobs adopt` records for a running thread. */
+function standingJob(fake: FakeT3, threadId: string): NewAdoptedJob {
+  const thread = fake.threads.get(threadId)!;
+  return {
+    id: 'synthcli01', projectAlias: 'pilot', hostId: 'main', t3ProjectId: thread.projectId, state: 'running', title: thread.title,
+    branch: thread.branch ?? '', runtimeMode: thread.runtimeMode, threadId, threadTitle: thread.title, threadLink: null,
+    lastRunId: thread.runs.at(-1)?.runId ?? null, pendingRequestIds: [], latestMessageExcerpt: null, latestMessageTruncated: false,
+    latestActivityAt: null, readPosition: null, activityPosition: null, lastErrorCode: null, lastErrorMessage: null,
+    delegatedWork: [], delegatedUntracked: 0, delegatedUntrackedRunId: null,
+  };
 }
 
 describe('standing jobs: adopt', () => {
@@ -728,6 +756,44 @@ describe('standing jobs: CLI', () => {
     assert.equal((await cli('jobs', 'frobnicate')).code, 2);
     assertNotLogged(gw, ['Synthetic Chief of Staff', 'Synthetic chief of staff', 'Synthetic report']);
   });
+
+  for (const via of ['the launch answer', 'reconciliation'] as const) {
+    test(`jobs adopt in another process takes a launching job's thread before or after ${via} attaches it, never in between`, async (t) => {
+      const harness = await startJobHarness(t);
+      const { fake, gw, agent, tick, tickAfter } = harness;
+      const launched = await startJob(agent);
+      if (via === 'reconciliation') {
+        fake.dropResponseOnce.add('t3_thread_launch');
+        await tick();
+        assert.equal(await jobState(agent, launched.jobId), 'unknown');
+      }
+      // The CLI adopts the thread the moment the gateway has checked that no other job follows it.
+      const cli = cliLedger(t, harness);
+      const store = gw.services.jobs.store;
+      const check = store.openJobForThread.bind(store);
+      let adoption: (() => unknown) | undefined;
+      let firstTry: unknown;
+      store.openJobForThread = (threadId, hostId) => {
+        const follower = check(threadId, hostId);
+        if (!adoption) {
+          adoption = () => cli.adopt(standingJob(fake, threadId));
+          try {
+            adoption();
+          } catch (error) {
+            firstTry = error;
+          }
+        }
+        return follower;
+      };
+      await (via === 'reconciliation' ? tickAfter(60_000) : tick());
+
+      const threadId = fake.threadForJob(launched.jobId).threadId;
+      const following = store.list({ states: OPEN_STATES, limit: 10 }).filter((job) => job.threadId === threadId);
+      assert.deepEqual(following.map((job) => [job.id, job.state]), [[launched.jobId, 'running']], 'one job follows the thread');
+      assert.match(String(firstTry), /database is locked/, "the CLI's write waited for the gateway's");
+      assert.throws(adoption!, { code: 'job_state_conflict', message: new RegExp(`job ${launched.jobId}, which the gateway launched`) });
+    });
+  }
 });
 
 describe('standing jobs: where agents send work', () => {
