@@ -5,6 +5,7 @@ import {
   SdkHttpError,
   StreamableHTTPClientTransport,
   UnauthorizedError,
+  type Tool,
 } from '@modelcontextprotocol/client';
 import type * as z from 'zod';
 import { GatewayError, type ErrorCode } from '../errors.ts';
@@ -41,6 +42,8 @@ export const DEFAULT_T3_TIMEOUT_MS = 15_000;
 /** Projects are read in pages of 100; a host with more than 20 pages is not enumerated at all (`catalog_limit`). */
 export const MAX_PROJECT_PAGES = 20;
 export const PROJECT_PAGE_SIZE = 100;
+/** `tools/list` pages read before the listing counts as not converging. */
+export const MAX_TOOL_PAGES = 10;
 
 export interface T3ClientOptions {
   hostId: string;
@@ -140,7 +143,38 @@ export class T3Client {
    * Transport failures are thrown as T3TransportError, whose `delivery` tells the two cases apart.
    * Only session-level failures replace the connection; a timeout leaves other calls on it running.
    */
-  async callTool<T>(name: string, args: Record<string, unknown>, schema: z.ZodType<T>, options: CallOptions = {}): Promise<T> {
+  callTool<T>(name: string, args: Record<string, unknown>, schema: z.ZodType<T>, options: CallOptions = {}): Promise<T> {
+    return this.#request(options, async (client, timeout) => parseToolResult(name, await client.callTool({ name, arguments: args }, { timeout }), schema));
+  }
+
+  /**
+   * Every tool the host advertises (`tools/list`), read page by page: at most MAX_TOOL_PAGES pages, and a cursor
+   * that repeats is `t3_invalid_response`. Read-only, so retried like any read. `serverVersion` is the version T3
+   * reported when the session started.
+   */
+  async listTools(): Promise<{ tools: Tool[]; serverVersion: string | null }> {
+    const tools: Tool[] = [];
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < MAX_TOOL_PAGES; page++) {
+      const { result, serverVersion } = await this.#request({ readOnly: true }, async (client, timeout) => ({
+        result: await client.request({ method: 'tools/list', params: cursor === undefined ? {} : { cursor } }, { timeout }),
+        serverVersion: client.getServerVersion()?.version ?? null,
+      }));
+      tools.push(...result.tools);
+      if (result.nextCursor === undefined) return { tools, serverVersion };
+      if (seen.has(result.nextCursor)) throw new GatewayError('t3_invalid_response', `tools/list on host ${this.hostId} returned a cursor that repeats.`);
+      seen.add(result.nextCursor);
+      cursor = result.nextCursor;
+    }
+    throw new GatewayError('t3_invalid_response', `tools/list on host ${this.hostId} did not finish within ${MAX_TOOL_PAGES} pages.`);
+  }
+
+  /**
+   * One request on the session, with the retry and failure translation `callTool` documents. `send` runs once the
+   * session is connected; a GatewayError it throws (a T3 refusal, a malformed answer) is passed through untouched.
+   */
+  async #request<T>(options: CallOptions, send: (client: Client, timeout: number) => Promise<T>): Promise<T> {
     const timeout = options.timeoutMs ?? this.#timeoutMs;
     for (let attempt = 0; ; attempt++) {
       let sent = false;
@@ -149,8 +183,7 @@ export class T3Client {
         connection = this.#connect(timeout);
         const client = await connection.client;
         sent = true;
-        const result = await client.callTool({ name, arguments: args }, { timeout });
-        return parseToolResult(name, result, schema);
+        return await send(client, timeout);
       } catch (error) {
         if (error instanceof GatewayError) throw error;
         if (connection && sessionFailed(error, sent)) await this.#reset(connection.generation);

@@ -123,6 +123,16 @@ describe('T3 client', () => {
     await fake.forgetSessions();
     assert.ok(await client.environmentRead());
   });
+
+  test('lists the tools the host advertises with their input schemas and the server version', async (t) => {
+    const { fake, client } = await setup(t);
+    const { tools, serverVersion } = await client.listTools();
+    assert.equal(serverVersion, '0.0.0-test');
+    const read = tools.find((tool) => tool.name === 't3_thread_read');
+    assert.ok(read?.inputSchema.properties && 'threadId' in read.inputSchema.properties, 't3_thread_read comes with its input schema');
+    await fake.forgetSessions();
+    assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name), tools.map((tool) => tool.name), 'a forgotten session is retried');
+  });
 });
 
 describe('T3 session sharing', () => {
