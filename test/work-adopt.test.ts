@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, test, type TestContext } from 'node:test';
+import { ProtocolErrorCode } from '@modelcontextprotocol/client';
+import { GatewayError } from '../src/errors.ts';
 import { connectAgent, startJob, startJobHarness, type JobHarness, type JobHarnessOptions } from './helpers/jobs.ts';
 import { tempDir } from './helpers/tmp.ts';
 
@@ -219,6 +221,17 @@ describe('work_adopt: refusals', () => {
     const refusedMode = await h.agent.callError('work_adopt', { host: 'main', threadId: fullAccess, requestId: requestId() });
     assert.equal(refusedMode.code, 'invalid_argument');
     assert.match(refusedMode.text, /runtime mode "full-access", above the gateway's access "auto"/);
+    assert.deepEqual((await h.agent.call<{ jobs: unknown[] }>('work_list')).jobs, []);
+  });
+
+  test('a thread read T3 refuses at the protocol level is a T3 tool failure, not a missing thread', async (t) => {
+    const h = await harness(t);
+    const threadId = appThread(h);
+    h.fake.protocolErrors.set('t3_thread_read', ProtocolErrorCode.MethodNotFound);
+    const refused = await h.agent.callError('work_adopt', { host: 'main', threadId, requestId: requestId() });
+    assert.equal(refused.code, 't3_tool_failed');
+    assert.match(refused.text, /method_not_found/);
+    await assert.rejects(h.gw.services.jobs.adopt({ project: 'pilot', threadId }), (error: unknown) => error instanceof GatewayError && error.code === 't3_tool_failed');
     assert.deepEqual((await h.agent.call<{ jobs: unknown[] }>('work_list')).jobs, []);
   });
 

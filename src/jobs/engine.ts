@@ -6,7 +6,7 @@ import type { HostRegistry } from '../hosts/registry.ts';
 import { resolveProjectId } from '../hosts/projects.ts';
 import type { Logger } from '../log.ts';
 import { T3TransportError } from '../t3/client.ts';
-import { T3ToolError } from '../t3/results.ts';
+import { isT3NotFound, T3ToolError } from '../t3/results.ts';
 import type { LaunchResult, ThreadRead } from '../t3/schemas.ts';
 import { MINUTE, SECOND, type Clock } from '../time.ts';
 import { readActivity, refreshDelegated, scanActivity } from './activity.ts';
@@ -603,7 +603,7 @@ export class JobEngine {
     } catch (error) {
       if (!(error instanceof T3ToolError)) throw error;
       logger.warn('jobs.watch_failed', { jobId: job.id, hostId: job.hostId, errorCode: error.t3Code });
-      if (/not_found/.test(error.t3Code)) {
+      if (isT3NotFound(error)) {
         store.transition(job.id, {
           from: [job.state],
           to: job.state === 'cancel_requested' ? 'cancelled' : 'failed',

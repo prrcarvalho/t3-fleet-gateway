@@ -8,7 +8,7 @@ import type { HostRegistry } from '../hosts/registry.ts';
 import type { Logger } from '../log.ts';
 import { permits, permittedHosts, type AccessLevel, type Scope } from '../oauth/scopes.ts';
 import { T3TransportError, type T3Client } from '../t3/client.ts';
-import { T3ToolError } from '../t3/results.ts';
+import { isT3NotFound, T3ToolError } from '../t3/results.ts';
 import type { ThreadItem, ThreadRead } from '../t3/schemas.ts';
 import { HOUR, SECOND, type Clock } from '../time.ts';
 import { scanActivity } from './activity.ts';
@@ -669,7 +669,7 @@ export class JobService {
       questions = await client.listPendingRequests(threadId);
       activity = await scanActivity(client, threadId, read.items.at(-1)?.position ?? read.nextPosition);
     } catch (error) {
-      if (error instanceof T3ToolError && /not_found/.test(error.t3Code)) {
+      if (error instanceof T3ToolError && isT3NotFound(error)) {
         throw new GatewayError('not_found', `Host ${hostId} has no T3 thread ${threadId} (${error.t3Code}).`);
       }
       throw error;
