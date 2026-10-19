@@ -163,3 +163,23 @@ test('no T3 project name, model, option or constraint from discovery ever appear
   const events = JSON.stringify(gw.services.db.prepare('SELECT * FROM job_events').all());
   for (const value of [...Object.values(content), 'Synthetic-wrong-value-1c9e']) assert.equal(events.includes(value), false, 'content leaked into events');
 });
+
+test('no native read arguments, results, schemas or thread content ever appear in the logs', async (t) => {
+  const { fake, gw, agent } = await startJobHarness(t);
+  const content = {
+    message: 'Synthetic-app-thread-message-4b7e',
+    title: 'Synthetic-app-thread-title-e19c',
+    query: 'Synthetic-search-argument-77d0',
+    refused: 'Synthetic-refused-argument-a5c1',
+  };
+  const { threadId } = fake.startInApp({ projectId: 'project-1', title: content.title, message: content.message });
+  await agent.call('fleet_t3_tools', { host: 'main' });
+  const read = await agent.call<{ result: unknown }>('fleet_t3_call', { host: 'main', tool: 't3_thread_read', arguments: { threadId } });
+  assert.ok(JSON.stringify(read.result).includes(content.message), 'the agent got the thread content');
+  await agent.call('fleet_t3_call', { host: 'main', tool: 't3_thread_search', arguments: { query: content.query, projectId: 'project-1' } });
+  await agent.callError('fleet_t3_call', { host: 'main', tool: 't3_thread_send', arguments: { threadId, message: content.refused } });
+  await agent.callError('fleet_t3_call', { host: 'main', tool: 't3_thread_read', arguments: { threadId: content.refused } });
+
+  assert.ok(gw.logs.some((line) => line.includes('"tool":"fleet_t3_call"') && line.includes('"errorCode":"tool_not_allowed"')));
+  assertNotLogged(gw, [...Object.values(content), 'maxCharsPerItem']);
+});

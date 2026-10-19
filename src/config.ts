@@ -90,6 +90,12 @@ const hostSchema = z.strictObject({
   defaultModelSelection: modelSelectionSchema.nullable().default(null),
   defaultProject: z.string().min(1).max(64).optional(),
   discovery: discoverySchema.default(DEFAULT_DISCOVERY),
+  /**
+   * Agents may read this host's T3 directly through fleet_t3_tools and fleet_t3_call (an in-code allowlist of
+   * T3's read tools, every thread on the host included). On unless the operator opts the host out; independent
+   * of discovery.
+   */
+  nativeReads: z.boolean().default(true),
 });
 
 const projectSchema = z

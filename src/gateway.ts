@@ -16,6 +16,7 @@ import type { Logger } from './log.ts';
 import { catalogTools } from './mcp/catalogTools.ts';
 import { createMcpEndpoint } from './mcp/endpoint.ts';
 import { fleetStatusTool } from './mcp/fleetStatus.ts';
+import { nativeTools } from './mcp/nativeTools.ts';
 import type { GatewayTool } from './mcp/tools.ts';
 import { workTools } from './mcp/workTools.ts';
 import { ApprovalCodes } from './oauth/approvalCodes.ts';
@@ -100,7 +101,7 @@ export function openServices(options: ServiceOptions): GatewayServices {
 }
 
 export function gatewayTools(services: GatewayServices): GatewayTool[] {
-  return [fleetStatusTool(services), ...catalogTools(services), ...workTools(services.jobs)];
+  return [fleetStatusTool(services), ...catalogTools(services), ...nativeTools(services), ...workTools(services.jobs)];
 }
 
 export interface RunningGateway {

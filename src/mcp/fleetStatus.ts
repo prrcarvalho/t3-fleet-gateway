@@ -37,6 +37,9 @@ const hostSchema = z.object({
       allowWorkStart: z.boolean().describe('true: work_start may target a discovered T3 project here by id; false: only configured aliases accept work'),
     })
     .describe('Opt-in discovery of T3 projects and model capabilities on this host'),
+  nativeReads: z
+    .boolean()
+    .describe("true: fleet_t3_tools and fleet_t3_call read this host's T3 (any thread on it); false: the operator opted the host out"),
 });
 
 const outputSchema = z.object({
@@ -100,7 +103,8 @@ function describeHost(host: HostStatus): string {
   const discovery = host.discovery.enabled
     ? `; discovery on (fleet_projects, fleet_models${host.discovery.allowWorkStart ? '; work_start accepts target' : '; launches need a configured alias'})`
     : '';
-  return `${host.id}: ${reach}; ${credential}${renewal}; ${host.runningJobs} running, ${host.queuedJobs} queued (max ${host.maxConcurrentJobs})${discovery}${scratch}`;
+  const native = host.nativeReads ? '; native reads on (fleet_t3_tools, fleet_t3_call)' : '; native reads off';
+  return `${host.id}: ${reach}; ${credential}${renewal}; ${host.runningJobs} running, ${host.queuedJobs} queued (max ${host.maxConcurrentJobs})${discovery}${native}${scratch}`;
 }
 
 export function fleetStatusTool(deps: { config: GatewayConfig; registry: HostRegistry; db: Database; jobs: JobService }) {
@@ -121,7 +125,8 @@ export function fleetStatusTool(deps: { config: GatewayConfig; registry: HostReg
       'follow its replies with work_feed and work_status, rather than starting jobs. When allowWorkStart is false, work_start ' +
       'is refused there and the standing jobs are the way in. If the operator approved you for selected machines only, you ' +
       'see just those hosts and their projects, and every work tool works only with jobs on them. A host with discovery.enabled ' +
-      'true also has T3 projects beyond these aliases and a model catalog: fleet_projects and fleet_models list them. Use this first ' +
+      'true also has T3 projects beyond these aliases and a model catalog: fleet_projects and fleet_models list them. On a host with ' +
+      'nativeReads true, fleet_t3_tools and fleet_t3_call read its T3 directly, any thread included. Use this first ' +
       'to learn the project aliases and where to send work, or to check why work is not progressing. Read-only; safe to call any time.',
     scope: READ_SCOPE,
     readOnly: true,
@@ -153,6 +158,7 @@ export function fleetStatusTool(deps: { config: GatewayConfig; registry: HostReg
             runningJobs: jobs.running,
             queuedJobs: jobs.queued,
             discovery: { enabled: host.discovery.enabled, allowWorkStart: host.discovery.allowWorkStart },
+            nativeReads: host.nativeReads,
           };
         }),
       );

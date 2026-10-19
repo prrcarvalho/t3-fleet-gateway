@@ -38,6 +38,14 @@ describe('config', () => {
     invalid({ ...minimal, projects: [{ ...project, allowWorkStart: 'no' }] }, /projects\[0\]\.allowWorkStart/);
   });
 
+  test('hosts allow native reads unless nativeReads is false, independent of discovery', () => {
+    const host = minimal.hosts[0]!;
+    const config = parseConfig({ ...minimal, hosts: [host, { ...host, id: 'second', nativeReads: false }] });
+    assert.deepEqual(config.hosts.map((entry) => [entry.nativeReads, entry.discovery.enabled]), [[true, false], [false, false]]);
+    invalid({ ...minimal, hosts: [{ ...host, nativeReads: 'yes' }] }, /hosts\[0\]\.nativeReads/);
+    invalid({ ...minimal, hosts: [{ ...host, discovery: { nativeReads: false } }] }, /Unrecognized key/);
+  });
+
   test('the committed example config is valid', () => {
     const config = loadConfig(join(import.meta.dirname, '..', 'config.example.json'));
     assert.equal(config.projects[0]?.runtimeMode, 'approval-required');
