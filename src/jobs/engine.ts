@@ -288,8 +288,10 @@ export class JobEngine {
       const plan = job.launchSpec ? await this.#planFromSpec(host, job, job.launchSpec) : await this.#planFromConfig(job);
       if (!plan) continue;
       this.#probeRetries.delete(job.id);
+      // Counted again: while the plan was read from T3, work_adopt may have taken the free slot.
       const dispatching = store.transition(job.id, {
         from: ['queued'],
+        slotLimit: host.maxConcurrentJobs,
         to: 'dispatching',
         changes: { t3ProjectId: plan.projectId, dispatchStartedAt: clock() },
       });

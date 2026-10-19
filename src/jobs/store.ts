@@ -421,6 +421,8 @@ export interface TransitionOptions {
   turnRunId?: string | null;
   /** The transition happens only if the job is in one of these states. */
   from: readonly JobState[];
+  /** The transition happens only while fewer jobs than this hold one of the job's host's slots (`slotHolders`). */
+  slotLimit?: number;
   to: JobState;
   changes?: JobChanges;
   detail?: EventDetail;
@@ -728,6 +730,7 @@ export class JobStore {
   #transition(id: string, options: TransitionOptions): Job | undefined {
     const current = this.get(id);
     if (!current || !options.from.includes(current.state)) return undefined;
+    if (options.slotLimit !== undefined && this.slotHolders(current.hostId) >= options.slotLimit) return undefined;
     if (options.expected && JSON.stringify(current) !== JSON.stringify(options.expected)) return undefined;
     if (options.gatewayTurn) this.#recordTurn(id, options.gatewayTurn.runId, options.gatewayTurn.clientId);
     const now = this.#clock();
