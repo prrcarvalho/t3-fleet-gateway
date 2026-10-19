@@ -265,6 +265,27 @@ describe('work_adopt: running and waiting threads', () => {
     assert.deepEqual(adoptedPayloads.map((payload) => [payload.type, payload.standing]), [['idle', false]]);
   });
 
+  test('a running thread adopted while the dispatcher prepares a launch takes the free slot, and the queued job waits for it', async (t) => {
+    const h = await harness(t, { maxConcurrentJobs: 1 });
+    const queued = await startJob(h.agent);
+    h.fake.holdResponses.add('t3_environment_read');
+    const dispatching = h.tick();
+    await h.fake.whenHeld('t3_environment_read');
+    const threadId = appThread(h);
+    const { job } = await adopt(h, threadId);
+    assert.equal(job.state, 'running');
+    h.fake.holdResponses.clear();
+    h.fake.releaseHeld();
+    await dispatching;
+
+    const status = await h.agent.call<JobView & { recentEvents: { type: string }[] }>('work_status', { jobId: queued.jobId });
+    assert.deepEqual([status.state, status.recentEvents.map((event) => event.type)], ['queued', ['created']], 'the host was at its limit');
+    assert.equal(h.fake.calls.includes('t3_thread_launch'), false);
+    h.fake.endTurn(threadId);
+    await h.tick();
+    assert.equal(await jobState(h.agent, queued.jobId), 'running', 'launched once the adopted job freed the slot');
+  });
+
   test('a thread waiting on a question is adopted needs_input with its question, which work_respond answers', async (t) => {
     const h = await harness(t);
     const threadId = appThread(h);
