@@ -1,5 +1,5 @@
 import { probeWorkspace, type WorkspaceSelection } from './workspace.ts';
-import { configuredModel, type GatewayConfig, type HostConfig, type ProjectConfig } from '../config.ts';
+import { configuredModel, runtimeModeAllowed, type GatewayConfig, type HostConfig, type ProjectConfig, type RuntimeMode } from '../config.ts';
 import { sha256Hex } from '../crypto.ts';
 import { describeError, GatewayError } from '../errors.ts';
 import type { CatalogProject, CatalogService } from '../hosts/catalog.ts';
@@ -18,7 +18,7 @@ import { canonicalSelection, validateSelection, type LaunchSpec, type ModelSelec
 import { readWorkerMessages, type MessagePage, type MessageQuery } from './messages.ts';
 import { cancelRequestId } from './interrupt.ts';
 import { isTerminal, OPEN_STATES, type JobState } from './states.ts';
-import { jobNotFound, type FeedEvent, type Job, type JobEvent, type JobScope, type JobStore } from './store.ts';
+import { jobNotFound, type FeedEvent, type Job, type JobEvent, type JobScope, type JobStore, type NewAdoptedJob } from './store.ts';
 import { launchPolicy, mapProjects, parseProjectRef, projectRef } from './targets.ts';
 
 /** Bounds on agent-supplied text. T3 accepts up to 120,000 characters per message. */
@@ -104,6 +104,21 @@ export interface AdoptInput {
   threadId: string;
   /** Shown to agents instead of the thread's T3 title. */
   title?: string | undefined;
+}
+
+/** work_adopt: a thread on a host, taken over by the calling agent. */
+export interface AdoptThreadInput {
+  host: string;
+  threadId: string;
+  requestId: string;
+  /** Shown to agents instead of the thread's T3 title; the thread is never renamed. */
+  title?: string | undefined;
+}
+
+/** A thread read for adoption: its detail, and every field of the job that follows it except the id, label and title. */
+interface ObservedThread {
+  thread: ThreadRead['thread'];
+  job: Omit<NewAdoptedJob, 'id' | 'projectAlias' | 'title'>;
 }
 
 export interface Feed {
@@ -273,6 +288,12 @@ export class JobService {
     throw jobNotFound(jobId);
   }
 
+  /** The rows of the ledger an agent may operate on: its grant's hosts, unless it covers all. */
+  #operable(caller: Caller): JobScope {
+    const hosts = permittedHosts(caller.scopes, 'operate');
+    return hosts === 'all' ? {} : { hostIds: hosts };
+  }
+
   /** The rows of the ledger an agent may read: its grant's hosts, unless it covers all. */
   #visible(caller: Caller, mine = false): JobScope {
     const hosts = permittedHosts(caller.scopes, 'read');
@@ -300,8 +321,7 @@ export class JobService {
     const key = this.store.idempotencyKey(caller.clientId, 'work_start', input.requestId);
     // A retry returns the job of the first request, which the project config may since have moved to another host:
     // the agent must still be allowed to operate on the job's own host.
-    const hosts = permittedHosts(caller.scopes, 'operate');
-    const scope: JobScope = hosts === 'all' ? {} : { hostIds: hosts };
+    const scope = this.#operable(caller);
     const replayed = key && this.store.get(key.jobId, scope);
     if (key && !replayed) {
       throw new GatewayError(
@@ -568,38 +588,93 @@ export class JobService {
 
   /**
    * Adopt an existing T3 thread as a standing job (operator CLI only). The thread must belong to the
-   * project's T3 project. Its state comes from a read now, and both read positions (messages and
-   * activity view) start at the thread's current end, so the watcher follows only what happens from now
-   * on; delegated work still running is found by a bounded scan back through the activity view
-   * (scanActivity). Adopting a thread that is already a standing job of the project returns that job
+   * project's T3 project. Adopting a thread that is already a standing job of the project returns that job
    * (`created: false`).
    */
   async adopt(input: AdoptInput): Promise<{ job: Job; created: boolean }> {
     const project = this.project(input.project);
     const existing = this.store.openJobForThread(input.threadId);
     if (existing?.standing && existing.projectAlias === project.alias) return { job: existing, created: false };
-    const client = this.#registry.client(project.host);
     const projectId = await resolveProjectId(this.#registry, project);
-    let read: ThreadRead;
-    let questions: string[];
-    let activity: ActivityRead;
-    try {
-      read = await readToEnd(client, input.threadId);
-      questions = await client.listPendingRequests(input.threadId);
-      activity = await scanActivity(client, input.threadId, read.items.at(-1)?.position ?? read.nextPosition);
-    } catch (error) {
-      if (error instanceof T3ToolError && /not_found/.test(error.t3Code)) {
-        throw new GatewayError('not_found', `Host ${project.host} has no T3 thread ${input.threadId} (${error.t3Code}).`);
-      }
-      throw error;
-    }
-    const { thread } = read;
+    const { thread, job } = await this.#observeThread(project.host, input.threadId, true);
     if (thread.projectId !== projectId) {
       throw new GatewayError(
         'invalid_argument',
         `Thread ${input.threadId} belongs to T3 project ${thread.projectId}, not to project "${project.alias}" (T3 project ${projectId}).`,
       );
     }
+    return this.store.adopt({ ...job, id: newJobId(), projectAlias: project.alias, title: input.title ?? thread.title });
+  }
+
+  /**
+   * work_adopt: take over an existing T3 thread as an ordinary job of the calling agent (docs/design.md, "Taking over a
+   * thread"). Authorization and the host's nativeReads come before the ledger and T3. A repeated request id, or a
+   * thread an open job already follows, returns that job without asking T3. Nothing is launched, renamed or
+   * reconfigured; the job starts in the thread's observed state and holds a slot while running, even past the limit.
+   */
+  async adoptThread(caller: Caller, input: AdoptThreadInput): Promise<{ job: Job; created: boolean }> {
+    const host = this.#hostFor(caller, input.host, 'operate');
+    if (!host.nativeReads) {
+      throw new GatewayError(
+        'native_reads_disabled',
+        `Host ${host.id} does not allow native reads (the operator set nativeReads false), so its threads cannot be taken over.`,
+      );
+    }
+    const request = {
+      clientId: caller.clientId,
+      requestId: input.requestId,
+      inputHash: inputHash('work_adopt', { host: input.host, threadId: input.threadId, title: input.title }),
+    };
+    const scope = this.#operable(caller);
+    const before = this.store.adoptedBefore(host.id, input.threadId, request, scope);
+    if (before) return before;
+    const { thread, job } = await this.#observeThread(host.id, input.threadId, false);
+    if (thread.archived === true) {
+      throw new GatewayError(
+        'invalid_argument',
+        `Thread ${thread.threadId} on host ${host.id} is archived, and T3 sends nothing to archived threads: unarchive it in T3 first.`,
+      );
+    }
+    if (!runtimeModeAllowed(job.runtimeMode as RuntimeMode, host.access)) {
+      throw new GatewayError(
+        'invalid_argument',
+        `Thread ${thread.threadId} runs in runtime mode ${JSON.stringify(job.runtimeMode)}, above the gateway's access "${host.access}" ` +
+          `on host ${host.id}: T3 would refuse every message the gateway sends it. Lower the thread's mode in T3, or ask the operator ` +
+          "to raise the host's access.",
+      );
+    }
+    // A label only: the configured alias exactly one alias maps to, else the internal ref. Nothing is launched, so no launch policy applies.
+    const mapping = mapProjects(this.#config, host.id, (await this.#catalog.projects(host.id)).value).get(thread.projectId);
+    const alias = mapping?.aliases.length === 1 && mapping.ambiguousAliases.length === 0
+      ? mapping.aliases[0]!.alias
+      : projectRef(host.id, thread.projectId);
+    const result = this.store.adoptForAgent({ ...job, id: newJobId(), projectAlias: alias, title: input.title ?? thread.title }, request, scope);
+    if (result.created) this.wake();
+    return result;
+  }
+
+  /**
+   * Read a thread being adopted. Its state comes from a read now, and both read positions (messages and activity view)
+   * start at the thread's current end, so the watcher follows only what happens from now on; delegated work still
+   * running is found by a bounded scan back through the activity view (scanActivity). A thread T3 does not know is
+   * `not_found`.
+   */
+  async #observeThread(hostId: string, threadId: string, standing: boolean): Promise<ObservedThread> {
+    const client = this.#registry.client(hostId);
+    let read: ThreadRead;
+    let questions: string[];
+    let activity: ActivityRead;
+    try {
+      read = await readToEnd(client, threadId);
+      questions = await client.listPendingRequests(threadId);
+      activity = await scanActivity(client, threadId, read.items.at(-1)?.position ?? read.nextPosition);
+    } catch (error) {
+      if (error instanceof T3ToolError && /not_found/.test(error.t3Code)) {
+        throw new GatewayError('not_found', `Host ${hostId} has no T3 thread ${threadId} (${error.t3Code}).`);
+      }
+      throw error;
+    }
+    const { thread } = read;
     const lastRunId = thread.activeRunId ?? thread.latestRunId;
     const seen = observe(
       {
@@ -609,7 +684,7 @@ export class JobService {
         activityPosition: null,
         threadLink: null,
         latestActivityAt: null,
-        standing: true,
+        standing,
         delegatedWork: [],
         delegatedUntracked: 0,
         delegatedUntrackedRunId: null,
@@ -619,31 +694,31 @@ export class JobService {
       activity,
     );
     const runtimeMode = (thread as { runtimeMode?: unknown }).runtimeMode;
-    return this.store.adopt({
-      id: newJobId(),
-      projectAlias: project.alias,
-      hostId: project.host,
-      t3ProjectId: projectId,
-      state: seen.state,
-      title: input.title ?? thread.title,
-      branch: thread.branch ?? '',
-      runtimeMode: typeof runtimeMode === 'string' ? runtimeMode : '',
-      threadId: thread.threadId,
-      threadTitle: thread.title,
-      threadLink: threadLinkTarget(thread.link),
-      lastRunId: seen.lastRunId,
-      pendingRequestIds: seen.pendingRequestIds,
-      latestMessageExcerpt: seen.excerpt ?? null,
-      latestMessageTruncated: seen.excerptTruncated ?? false,
-      latestActivityAt: seen.activityAt,
-      readPosition: seen.readPosition,
-      activityPosition: seen.activityPosition,
-      lastErrorCode: seen.errorCode ?? null,
-      lastErrorMessage: seen.errorCode ? 'The latest T3 run failed. Open the thread in T3 for details.' : null,
-      delegatedWork: seen.delegatedWork,
-      delegatedUntracked: seen.delegatedUntracked,
-      delegatedUntrackedRunId: seen.delegatedUntrackedRunId,
-    });
+    return {
+      thread,
+      job: {
+        hostId,
+        t3ProjectId: thread.projectId,
+        state: seen.state,
+        branch: thread.branch ?? '',
+        runtimeMode: typeof runtimeMode === 'string' ? runtimeMode : '',
+        threadId: thread.threadId,
+        threadTitle: thread.title,
+        threadLink: threadLinkTarget(thread.link),
+        lastRunId: seen.lastRunId,
+        pendingRequestIds: seen.pendingRequestIds,
+        latestMessageExcerpt: seen.excerpt ?? null,
+        latestMessageTruncated: seen.excerptTruncated ?? false,
+        latestActivityAt: seen.activityAt,
+        readPosition: seen.readPosition,
+        activityPosition: seen.activityPosition,
+        lastErrorCode: seen.errorCode ?? null,
+        lastErrorMessage: seen.errorCode ? 'The latest T3 run failed. Open the thread in T3 for details.' : null,
+        delegatedWork: seen.delegatedWork,
+        delegatedUntracked: seen.delegatedUntracked,
+        delegatedUntrackedRunId: seen.delegatedUntrackedRunId,
+      },
+    };
   }
 
   /**

@@ -19,6 +19,7 @@ import {
 import { JOB_STATES, STATE_MEANINGS } from '../jobs/states.ts';
 import { MAX_SELECTION_CHARS, MAX_SELECTION_ID_CHARS, MAX_SELECTION_OPTIONS } from '../jobs/launchSpec.ts';
 import type { FeedEvent, Job, JobEvent } from '../jobs/store.ts';
+import { parseProjectRef } from '../jobs/targets.ts';
 import { OPERATE_SCOPE, READ_SCOPE } from '../oauth/scopes.ts';
 import { HOUR, isoTime } from '../time.ts';
 import { defineTool, type GatewayTool, type ToolContext } from './tools.ts';
@@ -84,7 +85,7 @@ const jobSchema = z.object({
   projectName: z.string().nullable().describe('The T3 project title, recorded for scratch jobs and jobs started with a target or a modelSelection'),
   source: z
     .enum(['alias', 'discovered'])
-    .describe("alias: launched with a configured project's settings; discovered: into a T3 project no alias names, with the host's discovery policy"),
+    .describe("alias: in a configured project, launched with its settings; discovered: in a T3 project no alias names (launched with the host's discovery policy)"),
   model: z
     .object({
       source: modelSourceSchema.describe('explicit: your modelSelection; project or host: the gateway config; t3_default: the T3 project default'),
@@ -94,14 +95,26 @@ const jobSchema = z.object({
     .describe('Recorded for scratch, targeted or explicitly selected jobs; null for alias-only worktree jobs, whose model comes from the config at dispatch'),
   title: z
     .string()
-    .describe("The T3 thread title; a launched job's ends with the marker [job:<jobId>], a standing job's is the title the operator gave it"),
-  workspaceMode: z.enum(['scratch', 'root', 'worktree']).nullable().describe('scratch for T3 internal scratch; root for the local checkout; worktree for a fresh wt; null for adopted standing threads'),
-  branch: z.string().describe("The git branch of the job worktree; empty for scratch or root (a standing job: its thread's branch, or empty)"),
+    .describe(
+      "The T3 thread title; a launched job's ends with the marker [job:<jobId>], a standing job's is the title the operator gave it, " +
+        "an adopted job's the title given to work_adopt or the thread's own",
+    ),
+  workspaceMode: z
+    .enum(['scratch', 'root', 'worktree'])
+    .nullable()
+    .describe('scratch for T3 internal scratch; root for the local checkout; worktree for a fresh wt; null for standing and adopted threads'),
+  branch: z.string().describe("The git branch of the job worktree; empty for scratch or root (a standing or adopted job: its thread's branch, or empty)"),
   standing: z
     .boolean()
     .describe(
       'true for a standing job: a long-lived T3 thread the operator registered (for example a coordinator), not one work_start ' +
         'launched. Send it work with work_continue; work_cancel only interrupts its current turn, and it stays open',
+    ),
+  adopted: z
+    .boolean()
+    .describe(
+      'true for a job taken over with work_adopt: an existing T3 thread (one a person started in the T3 app, say), not launched by the ' +
+        'gateway. Otherwise it behaves like a job work_start started: work_cancel ends it, and the T3 thread stays',
     ),
   waitingOnDelegatedWork: z
     .boolean()
@@ -226,12 +239,13 @@ export function jobView(job: Job, context: ToolContext): JobView {
     host: job.hostId,
     projectId: job.t3ProjectId,
     projectName: spec?.projectName ?? null,
-    source: spec?.source ?? 'alias',
+    source: spec?.source ?? (parseProjectRef(job.projectAlias) ? 'discovered' : 'alias'),
     model: spec ? { source: spec.model.source, selection: spec.model.selection } : null,
     title: job.title,
-    workspaceMode: job.standing ? null : spec && spec.v !== 1 ? spec.workspace.kind : 'worktree',
+    workspaceMode: job.standing || job.adopted ? null : spec && spec.v !== 1 ? spec.workspace.kind : 'worktree',
     branch: job.branch,
     standing: job.standing,
+    adopted: job.adopted,
     waitingOnDelegatedWork: job.delegatedWork.length > 0 || job.delegatedUntracked > 0,
     delegatedTasks: job.delegatedWork.map((task) => task.title),
     delegatedTasksUntracked: job.delegatedUntracked,
@@ -260,7 +274,7 @@ export function eventView(event: JobEvent): z.infer<typeof eventSchema> {
 
 function describeJob(job: JobView): string {
   const waiting = job.waitingOnDelegatedWork ? ', waiting on delegated work' : '';
-  return `${job.jobId} [${job.state}${job.standing ? ', standing' : ''}${waiting}] ${job.project}: ${job.title}`;
+  return `${job.jobId} [${job.state}${job.standing ? ', standing' : ''}${job.adopted ? ', adopted' : ''}${waiting}] ${job.project}: ${job.title}`;
 }
 
 export function workTools(jobs: JobService): GatewayTool[] {
@@ -301,6 +315,43 @@ export function workTools(jobs: JobService): GatewayTool[] {
       const { job, created } = await jobs.start(context, input);
       const view = jobView(job, context);
       const prefix = created ? 'Started job' : 'Already started (same requestId):';
+      return { structured: { job: view, created }, summary: `${prefix} ${describeJob(view)}. Poll work_feed or work_status for progress.` };
+    },
+  });
+
+  const workAdopt = defineTool({
+    name: 'work_adopt',
+    title: 'Take over a thread',
+    description:
+      'Take over an existing T3 thread as a job you drive, for example one a person started in the T3 app: find it with fleet_t3_call ' +
+      '(t3_thread_list or t3_thread_search, then t3_thread_read) and pass its host and threadId (thread ids are per host). Nothing is ' +
+      'launched, and the thread is not renamed or reconfigured: the job starts in the state the thread is in now (running, needs_input ' +
+      'or idle; a turn already running is followed to its end) and from then on behaves like a job you started with work_start: ' +
+      'work_continue sends it instructions, work_respond answers its questions, work_status, work_messages and work_feed follow it, ' +
+      'and work_cancel interrupts a running turn and ends the job as cancelled (the T3 thread itself stays). While running it holds ' +
+      "one of the host's concurrency slots, even if that puts the host over its limit for a while; adoption is never refused or " +
+      'queued for lack of a slot. If an open job already follows the thread (one the gateway launched, a standing job, or one any ' +
+      'agent adopted), that job is returned with created false instead of a second one; drive it with the work_* tools. Refused: an ' +
+      'archived thread (invalid_argument: unarchive it in T3 first), a thread whose runtime mode is above what the host allows the ' +
+      'gateway (invalid_argument), a host the operator opted out of native reads (native_reads_disabled), a thread T3 does not know ' +
+      '(not_found). Idempotent: pass a unique requestId; repeating it with the same host, threadId and title returns the same job ' +
+      'without asking T3, and reusing it with different input is request_id_conflict. Request ids are scoped to this tool.',
+    scope: OPERATE_SCOPE,
+    readOnly: false,
+    inputSchema: z.object({
+      host: z.string().min(1).max(32).describe('Host id from fleet_status: the machine the thread is on'),
+      threadId: z.string().min(1).max(512).describe('The T3 thread id, from fleet_t3_call (t3_thread_list, t3_thread_search)'),
+      requestId: requestIdInput,
+      title: z.string().min(1).max(MAX_TITLE_CHARS).optional().describe("A title for the job; defaults to the thread's T3 title, which is never changed"),
+    }),
+    outputSchema: z.object({
+      job: jobSchema,
+      created: z.boolean().describe('false: this requestId was already used, or an open job already follows the thread; that job is returned'),
+    }),
+    async run(input, context) {
+      const { job, created } = await jobs.adoptThread(context, input);
+      const view = jobView(job, context);
+      const prefix = created ? 'Adopted the thread as job' : 'Already followed by job';
       return { structured: { job: view, created }, summary: `${prefix} ${describeJob(view)}. Poll work_feed or work_status for progress.` };
     },
   });
@@ -619,7 +670,7 @@ export function workTools(jobs: JobService): GatewayTool[] {
     },
   });
 
-  return [workStart, workContinue, workRespond, workCancel, workStatus, workMessages, workList, workFeed];
+  return [workStart, workAdopt, workContinue, workRespond, workCancel, workStatus, workMessages, workList, workFeed];
 }
 
 const DELEGATED_ENDED =

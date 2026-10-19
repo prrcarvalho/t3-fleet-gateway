@@ -172,6 +172,8 @@ export const threadReadSchema = z.looseObject({
     activeRunId: z.string().nullable(),
     pendingRequestCount: z.number().int(),
     branch: z.string().nullable(),
+    /** T3 refuses messages to an archived thread. */
+    archived: z.boolean().optional(),
     updatedAt: z.string(),
   }).transform(withThreadLink),
   recentRuns: z.array(threadRunSchema),

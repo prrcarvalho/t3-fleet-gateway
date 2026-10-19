@@ -164,15 +164,16 @@ test('no T3 project name, model, option or constraint from discovery ever appear
   for (const value of [...Object.values(content), 'Synthetic-wrong-value-1c9e']) assert.equal(events.includes(value), false, 'content leaked into events');
 });
 
-test('no native read arguments, results, schemas or thread content ever appear in the logs', async (t) => {
-  const { fake, gw, agent } = await startJobHarness(t);
+test('no native read arguments, results, schemas or adopted thread content ever appear in the logs or events', async (t) => {
+  const { fake, gw, agent, tick } = await startJobHarness(t);
   const content = {
     message: 'Synthetic-app-thread-message-4b7e',
     title: 'Synthetic-app-thread-title-e19c',
     query: 'Synthetic-search-argument-77d0',
     refused: 'Synthetic-refused-argument-a5c1',
+    adoptTitle: 'Synthetic-adopted-job-title-0d4f',
   };
-  const { threadId } = fake.startInApp({ projectId: 'project-1', title: content.title, message: content.message });
+  const { threadId } = fake.startInApp({ projectId: 'project-1', title: content.title, message: content.message, runtimeMode: 'auto' });
   await agent.call('fleet_t3_tools', { host: 'main' });
   const read = await agent.call<{ result: unknown }>('fleet_t3_call', { host: 'main', tool: 't3_thread_read', arguments: { threadId } });
   assert.ok(JSON.stringify(read.result).includes(content.message), 'the agent got the thread content');
@@ -180,6 +181,13 @@ test('no native read arguments, results, schemas or thread content ever appear i
   await agent.callError('fleet_t3_call', { host: 'main', tool: 't3_thread_send', arguments: { threadId, message: content.refused } });
   await agent.callError('fleet_t3_call', { host: 'main', tool: 't3_thread_read', arguments: { threadId: content.refused } });
 
+  await agent.call('work_adopt', { host: 'main', threadId, requestId: 'adopt-log', title: content.adoptTitle });
+  fake.finishTurn(threadId, content.message);
+  await tick();
+
   assert.ok(gw.logs.some((line) => line.includes('"tool":"fleet_t3_call"') && line.includes('"errorCode":"tool_not_allowed"')));
+  assert.ok(gw.logs.some((line) => line.includes('"event":"job.adopted"')));
   assertNotLogged(gw, [...Object.values(content), 'maxCharsPerItem']);
+  const events = JSON.stringify(gw.services.db.prepare('SELECT * FROM job_events').all());
+  for (const value of Object.values(content)) assert.equal(events.includes(value), false, 'content leaked into events');
 });
