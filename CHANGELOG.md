@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Native reads**: `fleet_t3_tools { host }` lists the T3 read tools a host advertises, with live input schemas and the allowlisted names it lacks (`missing`); `fleet_t3_call { host, tool, arguments? }` forwards one call and returns T3's result unchanged. Agents with Read access can read any thread on the host, including threads the gateway did not start, and archived threads by id. Only an in-code allowlist of thirteen T3 read tools passes; writes, `t3_thread_wait`, thread-only tools and tools a later T3 adds are refused with `tool_not_allowed` before any T3 call. Results over 256 KiB are refused, never cut.
+- **`work_adopt { host, threadId, requestId, title? }`**: an agent with Operate access takes over an existing T3 thread as an ordinary job of its own, in the state observed from T3 (`running`, `needs_input` or `idle`), then drives it with the usual `work_*` tools. Idempotent on `requestId`; a thread an open job already follows returns that job (`created: false`). Archived threads and threads whose runtime mode is above the host's `access` are refused. Adopted jobs hold a concurrency slot while running and are marked `adopted` in job views.
+- `hosts[].nativeReads` (default `true`) turns the three tools off for a host (`native_reads_disabled`); `fleet_status` shows it per host. Independent of discovery.
+- Migration 13 adds `jobs.adopted`. Older builds refuse a ledger at version 13: stop them before upgrading, and downgrade from a pre-upgrade backup.
+
+### Fixed
+
+- T3's JSON-RPC refusals (invalid arguments, unknown tool) are reported as `t3_tool_failed` with `invalid_params` or `method_not_found` instead of a lost response that reset the T3 session.
+- A job that is already `idle` on a run that failed stays `idle` when it is next checked (a thread taken over after its run failed would otherwise fail at once).
+
 ## 0.1.9 (2026-10-17)
 
 ### Added
