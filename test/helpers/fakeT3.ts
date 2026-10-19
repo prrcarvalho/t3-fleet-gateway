@@ -262,6 +262,8 @@ export class FakeT3 {
   readonly dropResponseOnce = new Set<string>();
   /** Tools whose next call is answered with this bare HTTP status instead of running. */
   readonly statusOnce = new Map<string, number>();
+  /** Tool name to a JSON-RPC error code answered instead of running the tool, as T3 refuses a call at the protocol level. */
+  readonly protocolErrors = new Map<string, number>();
   /** Threads whose t3_thread_read answers in a shape that does not match T3's schema. */
   readonly brokenReads = new Set<string>();
   /** Thread id to a T3 failure returned by t3_thread_read for that thread only. */
@@ -631,6 +633,12 @@ export class FakeT3 {
     if (injected !== undefined && status !== undefined) {
       this.statusOnce.delete(injected);
       res.writeHead(status).end();
+      return;
+    }
+    const protocolError = injected === undefined ? undefined : this.protocolErrors.get(injected);
+    if (protocolError !== undefined) {
+      const error = { code: protocolError, message: `Synthetic protocol refusal of ${injected}` };
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', id: rpcId(body), error }));
       return;
     }
     const sessionId = req.headers['mcp-session-id'];
@@ -1079,6 +1087,10 @@ function toolName(body: Buffer | undefined): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function rpcId(body: Buffer | undefined): unknown {
+  return (JSON.parse(body?.toString() ?? '') as { id?: unknown }).id;
 }
 
 export async function startFakeT3(options: FakeT3Options = {}): Promise<FakeT3> {

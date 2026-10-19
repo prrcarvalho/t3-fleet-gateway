@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
+import { ProtocolErrorCode } from '@modelcontextprotocol/client';
 import { warnProjectsWithoutModel } from '../src/hosts/projects.ts';
 import { createLogger } from '../src/log.ts';
 import { DEFAULT_T3_TIMEOUT_MS } from '../src/t3/client.ts';
@@ -211,6 +212,22 @@ describe('failures that concern one job', () => {
     fake.finishTurn(fake.threadForJob(broken.jobId).threadId, 'Synthetic recovered');
     await tick();
     assert.equal(await jobState(agent, broken.jobId), 'idle', 'retried on the next tick');
+  });
+
+  test('a thread read T3 refuses at the protocol level is recorded on the job; only T3 saying the thread is gone fails it', async (t) => {
+    const { fake, agent, tick } = await startJobHarness(t);
+    const job = await startJob(agent);
+    await tick();
+    const { threadId } = fake.threadForJob(job.jobId);
+    fake.protocolErrors.set('t3_thread_read', ProtocolErrorCode.MethodNotFound);
+    await tick();
+    const refused = await agent.call<Status>('work_status', { jobId: job.jobId });
+    assert.deepEqual([refused.state, refused.lastError?.code], ['running', 'method_not_found'], 'T3 still runs the thread, so the job keeps its slot');
+    fake.protocolErrors.clear();
+    fake.readFailures.set(threadId, { code: 'thread_not_found', message: 'Synthetic missing thread.' });
+    await tick();
+    const missing = await agent.call<Status>('work_status', { jobId: job.jobId });
+    assert.deepEqual([missing.state, missing.lastError?.code], ['failed', 'thread_missing']);
   });
 
   test('a T3 error while reconciling one job is recorded on it; other jobs progress and queued work starts', async (t) => {

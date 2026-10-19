@@ -1,3 +1,4 @@
+import { ProtocolError, ProtocolErrorCode } from '@modelcontextprotocol/client';
 import * as z from 'zod';
 import { GatewayError } from '../errors.ts';
 
@@ -19,6 +20,30 @@ export class T3ToolError extends GatewayError {
     this.tool = tool;
     this.t3Code = t3Code;
   }
+}
+
+/**
+ * JSON-RPC errors that mean T3 refused a call before any tool code ran: it does not know the tool, or the arguments
+ * fail the tool's input schema (T3 answers those with InvalidParams, not with a tool result). T3 answered, so the
+ * session is fine and the call is not a lost response.
+ */
+const REFUSALS: ReadonlyMap<number, string> = new Map([
+  [ProtocolErrorCode.MethodNotFound, 'method_not_found'],
+  [ProtocolErrorCode.InvalidParams, 'invalid_params'],
+]);
+const REFUSAL_CODES = new Set(REFUSALS.values());
+
+export function protocolRefusal(tool: string, error: unknown): T3ToolError | undefined {
+  const code = error instanceof ProtocolError ? REFUSALS.get(error.code) : undefined;
+  return code === undefined ? undefined : new T3ToolError(tool, code, (error as ProtocolError).message);
+}
+
+/**
+ * T3 said that what the call named (a thread, say) does not exist: one of its own `*not_found` tool codes. A protocol
+ * refusal (`method_not_found`) never reached the tool, so it says nothing about the thread.
+ */
+export function isT3NotFound(error: T3ToolError): boolean {
+  return !REFUSAL_CODES.has(error.t3Code) && /not_found/.test(error.t3Code);
 }
 
 interface ToolResultShape {

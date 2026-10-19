@@ -1,7 +1,5 @@
 import {
   Client,
-  ProtocolError,
-  ProtocolErrorCode,
   SdkError,
   SdkErrorCode,
   SdkHttpError,
@@ -13,7 +11,7 @@ import type * as z from 'zod';
 import { GatewayError, type ErrorCode } from '../errors.ts';
 import { isTypeOfServiceRace } from '../processErrors.ts';
 import { GATEWAY_NAME, GATEWAY_VERSION } from '../version.ts';
-import { parseToolResult, T3ToolError } from './results.ts';
+import { parseToolResult, protocolRefusal } from './results.ts';
 import {
   capabilitiesSchema,
   environmentSchema,
@@ -151,7 +149,7 @@ export class T3Client {
       try {
         result = await client.callTool({ name, arguments: args }, { timeout });
       } catch (error) {
-        throw refusal(name, error) ?? error;
+        throw protocolRefusal(name, error) ?? error;
       }
       return parseToolResult(name, result, schema);
     });
@@ -362,21 +360,6 @@ export class T3Client {
     }
     return new T3TransportError('host_unreachable', `Cannot reach T3 on host ${this.hostId}${detail}`, delivery, { cause: error });
   }
-}
-
-/**
- * JSON-RPC errors that mean T3 refused a call before any tool code ran: it does not know the tool, or the arguments
- * fail the tool's input schema (T3 answers those with InvalidParams, not with a tool result). T3 answered, so the
- * session is fine and the call is not a lost response.
- */
-const REFUSALS: ReadonlyMap<number, string> = new Map([
-  [ProtocolErrorCode.MethodNotFound, 'method_not_found'],
-  [ProtocolErrorCode.InvalidParams, 'invalid_params'],
-]);
-
-function refusal(tool: string, error: unknown): T3ToolError | undefined {
-  const code = error instanceof ProtocolError ? REFUSALS.get(error.code) : undefined;
-  return code === undefined ? undefined : new T3ToolError(tool, code, (error as ProtocolError).message);
 }
 
 /** Drop null and undefined fields so optional T3 inputs are omitted rather than sent as null. */
