@@ -392,6 +392,26 @@ export interface AdoptionRequest {
   inputHash: string;
 }
 
+/** The thread T3 created for a launched job, as `attachThread` records it. */
+export interface ThreadAttachment {
+  thread: { threadId: string } & Pick<JobChanges, 'threadTitle' | 'threadLink' | 'lastRunId'>;
+  via: 'launched' | 'reconciled';
+  /** The run the launch started, recorded as a turn of the agent that started the job. */
+  gatewayTurn?: { runId: string; clientId: string };
+  /** Why the job cannot take the thread even when no other job follows it. */
+  failure?: { code: string; message: string };
+}
+
+/** Why a launched job does not take its thread: another open job took it over before the launch was confirmed. */
+function alreadyFollowed(follower: Job): { code: string; message: string } {
+  return {
+    code: 'thread_already_followed',
+    message:
+      `T3 created the job's thread, but job ${follower.id} took it over before the launch was confirmed. ` +
+      `Follow the work through job ${follower.id}.`,
+  };
+}
+
 export interface TransitionOptions {
   /** An observation must still match its source snapshot, including when the state stayed the same. */
   expected?: Job;
@@ -675,26 +695,55 @@ export class JobStore {
    * `to` may equal the current state: then only the changes are applied, guarded by that state.
    */
   transition(id: string, options: TransitionOptions): Job | undefined {
+    return transaction(this.#db, () => this.#transition(id, options));
+  }
+
+  /**
+   * Give a launched job the thread T3 created for it: the job becomes `running`, or stays `cancel_requested` (the caller
+   * then interrupts the run). It ends instead (`failed`, or `cancelled` when a cancel was requested), keeping the thread,
+   * when another open job on its host already follows the thread (`thread_already_followed`) or when `failure` says why
+   * it cannot take it. The check and the write are one transaction, so a takeover by another writer (`jobs adopt` runs
+   * in its own process) commits either before it, and this job ends, or after it, and finds this job following the
+   * thread. Undefined when the job is no longer launching.
+   */
+  attachThread(id: string, attachment: ThreadAttachment): Job | undefined {
     return transaction(this.#db, () => {
-      const current = this.get(id);
-      if (!current || !options.from.includes(current.state)) return undefined;
-      if (options.expected && JSON.stringify(current) !== JSON.stringify(options.expected)) return undefined;
-      if (options.gatewayTurn) this.#recordTurn(id, options.gatewayTurn.runId, options.gatewayTurn.clientId);
-      const now = this.#clock();
-      if (!this.#write(current, options.changes ?? {}, now, options.to)) return current;
-      if (current.state !== options.to) {
-        this.#insertEvent(id, 'state_changed', current.state, options.to, options.detail ?? {}, now, options.turnRunId);
-        this.#logger.info('job.state_changed', {
-          jobId: id,
-          from: current.state,
-          to: options.to,
-          reason: options.detail?.reason,
-          errorCode: options.detail?.code,
-        });
+      const job = this.get(id);
+      if (!job) return undefined;
+      const follower = this.openJobForThread(attachment.thread.threadId, job.hostId);
+      const failure = follower ? alreadyFollowed(follower) : attachment.failure;
+      if (failure) {
+        const changes = { ...attachment.thread, lastErrorCode: failure.code, lastErrorMessage: failure.message };
+        const detail = { reason: failure.code, code: failure.code };
+        return this.#transition(id, { from: ['dispatching', 'unknown'], to: 'failed', changes, detail })
+          ?? this.#transition(id, { from: ['cancel_requested'], to: 'cancelled', changes, detail });
       }
-      for (const event of options.events ?? []) this.#insertEvent(id, event.type, current.state, options.to, event.detail ?? {}, now, options.turnRunId);
-      return this.get(id);
+      const changes = { ...attachment.thread, lastErrorCode: null, lastErrorMessage: null };
+      const { gatewayTurn } = attachment;
+      return this.#transition(id, { from: ['dispatching', 'unknown'], to: 'running', changes, gatewayTurn, detail: { reason: attachment.via } })
+        ?? this.#transition(id, { from: ['cancel_requested'], to: 'cancel_requested', changes, gatewayTurn });
     });
+  }
+
+  #transition(id: string, options: TransitionOptions): Job | undefined {
+    const current = this.get(id);
+    if (!current || !options.from.includes(current.state)) return undefined;
+    if (options.expected && JSON.stringify(current) !== JSON.stringify(options.expected)) return undefined;
+    if (options.gatewayTurn) this.#recordTurn(id, options.gatewayTurn.runId, options.gatewayTurn.clientId);
+    const now = this.#clock();
+    if (!this.#write(current, options.changes ?? {}, now, options.to)) return current;
+    if (current.state !== options.to) {
+      this.#insertEvent(id, 'state_changed', current.state, options.to, options.detail ?? {}, now, options.turnRunId);
+      this.#logger.info('job.state_changed', {
+        jobId: id,
+        from: current.state,
+        to: options.to,
+        reason: options.detail?.reason,
+        errorCode: options.detail?.code,
+      });
+    }
+    for (const event of options.events ?? []) this.#insertEvent(id, event.type, current.state, options.to, event.detail ?? {}, now, options.turnRunId);
+    return this.get(id);
   }
 
   /** Change fields without changing state and without an event. */

@@ -52,6 +52,16 @@ function foundThread(thread: { threadId: string; title: string; latestRunId: str
   return { threadId, threadTitle: title, lastRunId: latestRunId, threadLink: threadLinkTarget(link), status };
 }
 
+/** A found thread on which no run ever started; `launchCode` is the launch's own error, if any. */
+function launchNotStarted(launchCode: string | null): { code: string; message: string } {
+  return {
+    code: 'launch_not_started',
+    message:
+      `T3 created the job's thread but started no run on it${launchCode ? ` (the launch answered ${launchCode})` : ''}, ` +
+      'so the task was never delivered. The thread is kept for inspection; start a new job if the work is still needed.',
+  };
+}
+
 function isHostFailure(error: unknown): error is GatewayError {
   return error instanceof GatewayError && !(error instanceof T3ToolError) && HOST_FAILURES.has(error.code);
 }
@@ -708,56 +718,23 @@ export class JobEngine {
   }
 
   /**
-   * Record the job's thread and move it to running. A job cancelled while its launch was in flight
-   * or unconfirmed keeps cancel_requested, and its thread is interrupted now. A found thread on
-   * which no run ever started never received the task: the job fails with `launch_not_started`
-   * (`launchCode` is the launch's own error, if any), keeping the thread so it can be inspected.
+   * Record the job's thread and move it to running, unless another open job already follows the thread (it took the
+   * thread over with jobs adopt, or with work_adopt after a person removed the marker from its title; see
+   * `JobStore.attachThread`). A job cancelled while its launch was in flight or unconfirmed keeps cancel_requested, and
+   * its thread is interrupted now. A found thread on which no run ever started never received the task: the job fails
+   * with `launch_not_started` (`launchCode` is the launch's own error, if any), keeping the thread so it can be inspected.
    */
   async #attach(jobId: string, thread: FoundThread, via: 'launched' | 'reconciled', launchCode: string | null): Promise<void> {
     const { store, registry } = this.#options;
     const { threadLink, status, ...rest } = thread;
-    const failure = this.#attachFailure(jobId, thread, launchCode);
-    if (failure) {
-      const changes = { ...rest, ...(threadLink ? { threadLink } : {}), lastErrorCode: failure.code, lastErrorMessage: failure.message };
-      const detail = { reason: failure.code, code: failure.code };
-      store.transition(jobId, { from: ['dispatching', 'unknown'], to: 'failed', changes, detail });
-      store.transition(jobId, { from: ['cancel_requested'], to: 'cancelled', changes, detail });
-      return;
-    }
-    const changes = { ...rest, ...(threadLink ? { threadLink } : {}), lastErrorCode: null, lastErrorMessage: null };
-    const gatewayTurn = via === 'launched' && thread.lastRunId !== null
-      ? { runId: thread.lastRunId, clientId: store.require(jobId).clientId } : undefined;
-    if (store.transition(jobId, { from: ['dispatching', 'unknown'], to: 'running', changes, gatewayTurn, detail: { reason: via } })) return;
-    const job = store.get(jobId);
-    if (job?.state !== 'cancel_requested') return;
-    store.transition(jobId, { from: ['cancel_requested'], to: 'cancel_requested', changes, gatewayTurn });
-    await this.#interrupt(jobId, job.hostId, { threadId: thread.threadId, runId: thread.lastRunId }, registry);
-  }
-
-  /**
-   * Why the job cannot take the thread T3 created for it: another open job took it over first (with jobs adopt, or with
-   * work_adopt after a person removed the marker from its title), or no run ever started on it, so the task was never delivered.
-   */
-  #attachFailure(jobId: string, thread: FoundThread, launchCode: string | null): { code: string; message: string } | undefined {
-    const { store } = this.#options;
-    const follower = store.openJobForThread(thread.threadId, store.require(jobId).hostId);
-    if (follower) {
-      return {
-        code: 'thread_already_followed',
-        message:
-          `T3 created the job's thread, but job ${follower.id} took it over before the launch was confirmed. ` +
-          `Follow the work through job ${follower.id}.`,
-      };
-    }
-    if (thread.status !== undefined && thread.lastRunId === null && !isActiveStatus(thread.status)) {
-      return {
-        code: 'launch_not_started',
-        message:
-          `T3 created the job's thread but started no run on it${launchCode ? ` (the launch answered ${launchCode})` : ''}, ` +
-          'so the task was never delivered. The thread is kept for inspection; start a new job if the work is still needed.',
-      };
-    }
-    return undefined;
+    const notStarted = status !== undefined && thread.lastRunId === null && !isActiveStatus(status);
+    const job = store.attachThread(jobId, {
+      thread: { ...rest, ...(threadLink ? { threadLink } : {}) },
+      via,
+      gatewayTurn: via === 'launched' && thread.lastRunId !== null ? { runId: thread.lastRunId, clientId: store.require(jobId).clientId } : undefined,
+      failure: notStarted ? launchNotStarted(launchCode) : undefined,
+    });
+    if (job?.state === 'cancel_requested') await this.#interrupt(jobId, job.hostId, { threadId: thread.threadId, runId: thread.lastRunId }, registry);
   }
 
   /** Deliver (or re-deliver) a cancel_requested job's interrupt for one run. T3 deduplicates repeats per run. */
