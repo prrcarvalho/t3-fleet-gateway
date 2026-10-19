@@ -146,6 +146,24 @@ Configure a scratch alias with `workspaceMode: "scratch"` and the verified ID of
 
 When the user names no project, the agent passes `target: { host: "machine-a" }` to `work_start`. An explicit project still uses its alias or project ID. An unknown named project must be resolved rather than sent to scratch. Existing aliases keep their worktree behavior unless explicitly changed.
 
+## Read any thread, take one over
+
+Your bot can read every T3 thread on a machine, not only the jobs it started: threads you opened in the T3 app too. `fleet_t3_tools` lists the T3 read tools a machine offers, with their arguments, and `fleet_t3_call` runs one. Ask your bot:
+
+```text
+On host <id>, use fleet_t3_tools, then fleet_t3_call with t3_thread_search
+to find my thread about <topic>. Read its latest messages and summarize them.
+```
+
+Only T3's read tools pass through; writes still go through the `work_*` tools. To have the bot drive that thread from now on, ask it to take it over:
+
+```text
+Take over that thread with work_adopt, then tell it to <next instruction>
+with work_continue. Report back when it finishes.
+```
+
+The adopted thread becomes one of the bot's jobs, in whatever state it is in now, and is followed like any other job; nothing in T3 is renamed or reconfigured. Archived threads cannot be taken over. Native reads are on for every machine by default; set `"nativeReads": false` on a host to keep its threads to yourself. [Native reads](docs/configuration.md#native-reads), [what they expose](docs/security.md).
+
 ## Keep a coordinator in the loop
 
 Already have a T3 thread that plans work and delegates to other agents? Adopt it as a **standing job** so your bot can keep talking to that same thread:
