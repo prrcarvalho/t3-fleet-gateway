@@ -18,6 +18,7 @@ import { MAX_PROJECT_PAGES, PROJECT_PAGE_SIZE } from '../t3/client.ts';
 import { effectivePolicy, launchPolicy, mapProjects, type EffectivePolicy } from '../jobs/targets.ts';
 import { permits, READ_SCOPE } from '../oauth/scopes.ts';
 import { isoTime } from '../time.ts';
+import { readableHost } from './hostAccess.ts';
 import { defineTool, type ToolContext } from './tools.ts';
 
 export const DEFAULT_PAGE = 50;
@@ -134,9 +135,7 @@ function targetHosts(deps: CatalogToolDeps, context: ToolContext, input: z.outpu
   if (input.cursor !== undefined && input.host === undefined) throw new GatewayError('invalid_argument', 'A cursor continues one host: pass host with it.');
   if (input.cursor !== undefined && input.refresh === true) throw new GatewayError('invalid_argument', 'Pass refresh or cursor, not both.');
   if (input.host === undefined) return deps.config.hosts.filter((host) => permits(context.scopes, 'read', host.id));
-  const host = deps.config.hosts.find((candidate) => candidate.id === input.host);
-  if (!host || !permits(context.scopes, 'read', host.id)) throw new GatewayError('not_found', `No host "${input.host}". fleet_status lists the hosts you can use.`);
-  return [host];
+  return [readableHost(deps.config, context, input.host)];
 }
 
 /**
