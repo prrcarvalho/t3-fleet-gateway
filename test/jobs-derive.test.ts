@@ -39,6 +39,7 @@ function job(overrides: Partial<Job> = {}): Job {
     finishedAt: null,
     launchSpec: null,
     standing: false,
+    adopted: false,
     delegatedWork: [],
     delegatedUntracked: 0,
     delegatedUntrackedRunId: null,

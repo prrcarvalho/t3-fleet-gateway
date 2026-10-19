@@ -118,11 +118,11 @@ describe('database', () => {
     const db = openDatabase(path);
     t.after(() => db.close());
     assert.equal(schemaVersion(db), SCHEMA_VERSION);
-    assert.equal(SCHEMA_VERSION, 12);
+    assert.equal(SCHEMA_VERSION, 13);
     const after = db.prepare('SELECT * FROM jobs ORDER BY rowid').all() as Record<string, unknown>[];
     assert.deepEqual(
       after.map(
-        ({ standing, delegated_work, activity_position, delegated_untracked, delegated_untracked_run_id, delegated_ended_at, latest_message_truncated, launch_spec, ...rest }) =>
+        ({ standing, delegated_work, activity_position, delegated_untracked, delegated_untracked_run_id, delegated_ended_at, latest_message_truncated, launch_spec, adopted, ...rest }) =>
           rest,
       ),
       before,
@@ -216,7 +216,7 @@ CREATE TABLE jobs (
     t.after(() => db.close());
     assert.equal(schemaVersion(db), SCHEMA_VERSION);
     const after = (db.prepare('SELECT * FROM jobs').all() as Record<string, unknown>[]).map(
-      ({ activity_position, delegated_untracked, delegated_untracked_run_id, delegated_ended_at, latest_message_truncated, launch_spec, ...rest }) => [activity_position, rest],
+      ({ activity_position, delegated_untracked, delegated_untracked_run_id, delegated_ended_at, latest_message_truncated, launch_spec, adopted, ...rest }) => [activity_position, rest],
     );
     assert.deepEqual(after, before.map((row) => [null, row]), 'existing jobs keep every column and have no activity position yet');
     const store = new JobStore(db, () => 1_000, silentLogger);
@@ -250,7 +250,7 @@ CREATE TABLE jobs (
     t.after(() => db.close());
     assert.equal(schemaVersion(db), SCHEMA_VERSION);
     const after = (db.prepare('SELECT * FROM jobs').all() as Record<string, unknown>[]).map(
-      ({ delegated_untracked, delegated_untracked_run_id, delegated_ended_at, latest_message_truncated, launch_spec, ...rest }) => [[delegated_untracked, delegated_untracked_run_id, delegated_ended_at], rest],
+      ({ delegated_untracked, delegated_untracked_run_id, delegated_ended_at, latest_message_truncated, launch_spec, adopted, ...rest }) => [[delegated_untracked, delegated_untracked_run_id, delegated_ended_at], rest],
     );
     assert.deepEqual(after, before.map((row) => [[0, null, null], row]), 'existing jobs keep every column, with nothing untracked or ended');
     const store = new JobStore(db, () => 1_000, silentLogger);
@@ -288,7 +288,7 @@ CREATE TABLE jobs (
     t.after(() => db.close());
     assert.equal(schemaVersion(db), SCHEMA_VERSION);
     const after = (db.prepare('SELECT * FROM jobs ORDER BY rowid').all() as Record<string, unknown>[]).map(
-      ({ latest_message_truncated, launch_spec, ...rest }) => [latest_message_truncated, rest],
+      ({ latest_message_truncated, launch_spec, adopted, ...rest }) => [latest_message_truncated, rest],
     );
     assert.deepEqual(after, before.map((row, index) => [[0, 1, 1, 0][index], row]), 'existing jobs keep every column; excerpts at the bound are cut');
     const store = new JobStore(db, () => 1_000, silentLogger);
@@ -331,9 +331,9 @@ CREATE TABLE jobs (
     assert.equal(schemaVersion(db), SCHEMA_VERSION);
     assert.deepEqual(
       tables.map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all().map((row) => {
-        // Migration 8 adds launch_spec to jobs, NULL for every existing row.
-        const { launch_spec, ...rest } = { ...row } as Record<string, unknown>;
-        if (table === 'jobs') assert.equal(launch_spec, null);
+        // Migrations 8 and 13 add launch_spec (NULL) and adopted (0) to jobs for every existing row.
+        const { launch_spec, adopted, ...rest } = { ...row } as Record<string, unknown>;
+        if (table === 'jobs') assert.deepEqual([launch_spec, adopted], [null, 0]);
         return table === 'jobs' ? rest : { ...row };
       })),
       before,
@@ -390,7 +390,7 @@ CREATE TABLE jobs (
     t.after(() => db.close());
     assert.equal(schemaVersion(db), SCHEMA_VERSION);
     assert.deepEqual(tables.map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()), before);
-    const jobs = (db.prepare('SELECT * FROM jobs ORDER BY rowid').all() as Record<string, unknown>[]).map(({ launch_spec, ...rest }) => [launch_spec, rest]);
+    const jobs = (db.prepare('SELECT * FROM jobs ORDER BY rowid').all() as Record<string, unknown>[]).map(({ launch_spec, adopted, ...rest }) => [launch_spec, rest]);
     assert.deepEqual(jobs, jobsBefore.map((row) => [null, row]), 'existing jobs keep every column and have no launch spec');
     const store = new JobStore(db, () => 1_000, silentLogger);
     assert.deepEqual([store.require('jobqueue001').launchSpec, store.require('jobstand001').launchSpec, store.require('jobstand001').standing], [null, null, true]);
@@ -438,14 +438,19 @@ CREATE TABLE jobs (
         VALUES ('old-route', 'old-ping', 1, 204, 'delivered');
     `);
     const tables = ['jobs', 'job_events', 'job_turns', 'webhook_deliveries', 'webhook_attempts'];
-    const before = tables.map((table) => old.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all());
+    const before = tables.map((table) => old.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all().map((row) => ({ ...row })));
     const subscriptions = old.prepare('SELECT * FROM webhook_subscriptions ORDER BY id').all().map((row) => ({ ...row }));
     old.close();
 
     const db = openDatabase(path);
     t.after(() => db.close());
     assert.equal(schemaVersion(db), SCHEMA_VERSION);
-    assert.deepEqual(tables.map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()), before);
+    assert.deepEqual(tables.map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all().map((row) => {
+      // Migration 13 adds adopted (0) to every existing job.
+      const { adopted, ...rest } = { ...row } as Record<string, unknown>;
+      if (table === 'jobs') assert.equal(adopted, 0);
+      return table === 'jobs' ? rest : { ...row };
+    })), before);
     const migrated = db.prepare('SELECT * FROM webhook_subscriptions ORDER BY id').all()
       .map(({ source, last_test_at, last_test_outcome, last_test_status_code, ...rest }) =>
         ({ source, last_test_at, last_test_outcome, last_test_status_code, original: rest }));
@@ -480,7 +485,7 @@ CREATE TABLE jobs (
     ).run();
     const tables = ['jobs', 'job_events', 'idempotency_keys', 'host_credentials', 'webhook_subscriptions', 'job_turns'];
     const before = tables.map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all());
-    migrate(db);
+    migrate(db, MIGRATIONS.slice(0, 12));
     assert.equal(schemaVersion(db), 12);
     assert.deepEqual(tables.map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()), before);
     assert.deepEqual(store.require('legacy0001').launchSpec, v1);
@@ -495,6 +500,52 @@ CREATE TABLE jobs (
     assert.throws(() => migrate(db, MIGRATIONS.slice(0, 11)), /schema version 12 is newer than this build supports \(11\)/);
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
     assert.equal(db.prepare('PRAGMA integrity_check').get()?.integrity_check, 'ok');
+  });
+
+  test('migration 13 adds jobs.adopted to a populated version 12 ledger, keeping every job, event, key and turn', (t) => {
+    const path = openDataDir(join(tempDir(t), 'data')).databasePath;
+    const old = new DatabaseSync(path);
+    old.exec('PRAGMA foreign_keys = ON');
+    migrate(old, MIGRATIONS.slice(0, 12));
+    assert.equal(schemaVersion(old), 12);
+    old.exec(`
+      INSERT INTO jobs (id, client_id, request_id, project_alias, host_id, t3_project_id, state, task, title, branch, runtime_mode, t3_thread_id,
+        last_run_id, created_at, updated_at, state_changed_at, launch_spec)
+        VALUES ('jobrun00001', 'client-1', 'request-1', 'pilot', 'main', 'project-1', 'running', 'Synthetic task', 'Synthetic [job:jobrun00001]',
+          'fleet/jobrun00001', 'auto', 'thread-1', 'thread-1-run-1', 1, 2, 2, NULL);
+      INSERT INTO jobs (id, client_id, request_id, project_alias, host_id, t3_project_id, state, task, title, branch, runtime_mode, t3_thread_id,
+        created_at, updated_at, state_changed_at, standing, activity_position, read_position)
+        VALUES ('jobstand001', 'operator', 'adopted', 'pilot', 'main', 'project-1', 'idle', '', 'Synthetic coordinator', '', '', 'thread-2',
+          1, 2, 3, 1, 20, 12);
+      INSERT INTO job_events (job_id, type, to_state, created_at) VALUES ('jobrun00001', 'created', 'queued', 1);
+      INSERT INTO job_events (job_id, type, to_state, detail, created_at) VALUES ('jobstand001', 'created', 'idle', '{"reason":"adopted"}', 1);
+      INSERT INTO idempotency_keys (client_id, tool, request_id, input_hash, job_id, created_at)
+        VALUES ('client-1', 'work_start', 'request-1', 'synthetic-request-hash', 'jobrun00001', 1);
+      INSERT INTO job_turns (job_id, run_id, client_id) VALUES ('jobrun00001', 'thread-1-run-1', 'client-1');
+    `);
+    const tables = ['job_events', 'idempotency_keys', 'job_turns'];
+    const before = tables.map((table) => old.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all());
+    const jobsBefore = old.prepare('SELECT * FROM jobs ORDER BY rowid').all().map((row) => ({ ...row }));
+    old.close();
+
+    const db = openDatabase(path);
+    t.after(() => db.close());
+    assert.equal(schemaVersion(db), 13);
+    assert.deepEqual(tables.map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()), before);
+    const jobs = (db.prepare('SELECT * FROM jobs ORDER BY rowid').all() as Record<string, unknown>[]).map(({ adopted, ...rest }) => [adopted, rest]);
+    assert.deepEqual(jobs, jobsBefore.map((row) => [0, row]), 'existing jobs keep every column and are not adopted');
+    const store = new JobStore(db, () => 1_000, silentLogger);
+    assert.deepEqual(['jobrun00001', 'jobstand001'].map((id) => [store.require(id).adopted, store.require(id).standing]), [[false, false], [false, true]]);
+    db.prepare("UPDATE jobs SET adopted = 1 WHERE id = 'jobrun00001'").run();
+    assert.equal(store.require('jobrun00001').adopted, true);
+    assert.throws(() => db.prepare("UPDATE jobs SET adopted = 2 WHERE id = 'jobrun00001'").run(), /CHECK/);
+    assert.throws(() => migrate(db, MIGRATIONS.slice(0, 12)), /schema version 13 is newer than this build supports \(12\)/);
+    assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
+    assert.equal((db.prepare('PRAGMA integrity_check').get() as { integrity_check: string }).integrity_check, 'ok');
+    const fresh = openDatabase(join(tempDir(t), 'fresh.db'));
+    t.after(() => fresh.close());
+    const schema = (target: typeof db) => target.prepare('SELECT type, name, sql FROM sqlite_master ORDER BY name').all();
+    assert.deepEqual(schema(db), schema(fresh));
   });
 
   test('a fork ledger that reused schema versions 9 and 10 is refused until its version is set back to 8', (t) => {

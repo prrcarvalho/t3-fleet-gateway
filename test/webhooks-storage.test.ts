@@ -74,12 +74,17 @@ describe('webhook migration and durable store boundaries', () => {
         VALUES ('client-1', 'work_start', 'request-1', 'synthetic-request-hash', 'oldjob0001', 1);
     `);
     const tables = ['oauth_clients', 'token_families', 'refresh_tokens', 'access_tokens', 'host_credentials', 'jobs', 'job_events', 'idempotency_keys'];
-    const before = tables.map((table) => old.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all());
+    const before = tables.map((table) => old.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all().map((row) => ({ ...row })));
     old.close();
     const db = openDatabase(path);
     t.after(() => db.close());
     assert.equal(schemaVersion(db), SCHEMA_VERSION);
-    assert.deepEqual(tables.map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()), before);
+    assert.deepEqual(tables.map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all().map((row) => {
+      // Migration 13 adds adopted (0) to every existing job.
+      const { adopted, ...rest } = { ...row } as Record<string, unknown>;
+      if (table === 'jobs') assert.equal(adopted, 0);
+      return table === 'jobs' ? rest : { ...row };
+    })), before);
     for (const table of ['job_turns', 'webhook_subscriptions', 'webhook_deliveries', 'webhook_attempts']) {
       assert.deepEqual(db.prepare(`SELECT * FROM ${table}`).all(), [], `${table} begins empty`);
     }

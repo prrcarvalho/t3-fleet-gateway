@@ -52,6 +52,11 @@ export interface Job {
    */
   standing: boolean;
   /**
+   * An existing T3 thread an agent took over with work_adopt: never launched, but otherwise an ordinary job of that
+   * agent (it holds a slot while running and ends like a launched job).
+   */
+  adopted: boolean;
+  /**
    * Work the thread delegated to other threads (T3 subagents) that is still running, from its timeline.
    * A coordinator is idle while it waits for such work, and T3 starts its next turn when the work is done.
    * At most MAX_DELEGATED_TASKS (derive.ts); cleared when the job finishes.
@@ -171,6 +176,7 @@ interface JobRow {
   dispatch_started_at: number | null;
   finished_at: number | null;
   standing: number;
+  adopted: number;
   delegated_work: string;
   delegated_untracked: number;
   delegated_untracked_run_id: string | null;
@@ -287,6 +293,7 @@ function toJob(row: JobRow): Job {
     dispatchStartedAt: row.dispatch_started_at,
     finishedAt: row.finished_at,
     standing: row.standing === 1,
+    adopted: row.adopted === 1,
     delegatedWork: parseDelegated(row.delegated_work),
     delegatedUntracked: row.delegated_untracked,
     delegatedUntrackedRunId: row.delegated_untracked_run_id,
