@@ -554,11 +554,19 @@ export class JobStore {
   }
 
   /**
-   * work_adopt before T3 is read: the job a repeated request id recorded, or the open job that already follows the
-   * thread on its host (the request id is then recorded against it). Undefined when the thread needs a new job.
+   * work_adopt's existing job: the one a repeated request id recorded, or the open job that already follows the thread
+   * on its host, or (once T3 is read) the open job without a thread yet whose marker ends the thread's title
+   * (`markedJobId`): a launch T3 has not confirmed. The request id is then recorded against it. Undefined when the
+   * thread needs a new job.
    */
-  adoptedBefore(hostId: string, threadId: string, request: AdoptionRequest, scope: JobScope): { job: Job; created: false } | undefined {
-    return transaction(this.#db, () => this.#adoptedBefore(hostId, threadId, request, scope));
+  adoptedBefore(
+    hostId: string,
+    threadId: string,
+    request: AdoptionRequest,
+    scope: JobScope,
+    markedJobId?: string,
+  ): { job: Job; created: false } | undefined {
+    return transaction(this.#db, () => this.#adoptedBefore(hostId, threadId, request, scope, markedJobId));
   }
 
   /**
@@ -566,9 +574,9 @@ export class JobStore {
    * `created` event (reason `adopted`) in its first state. The checks of `adoptedBefore` run again here, in the same
    * transaction as the insert and the request id's key, so a race between two requests leaves one job.
    */
-  adoptForAgent(job: NewAdoptedJob, request: AdoptionRequest, scope: JobScope): { job: Job; created: boolean } {
+  adoptForAgent(job: NewAdoptedJob, request: AdoptionRequest, scope: JobScope, markedJobId?: string): { job: Job; created: boolean } {
     return transaction(this.#db, () => {
-      const before = this.#adoptedBefore(job.hostId, job.threadId, request, scope);
+      const before = this.#adoptedBefore(job.hostId, job.threadId, request, scope, markedJobId);
       if (before) return before;
       const created = this.#insertAdopted(job, request);
       this.claimIdempotencyKey(request.clientId, 'work_adopt', request.requestId, { inputHash: request.inputHash, jobId: created.id });
@@ -576,10 +584,18 @@ export class JobStore {
     });
   }
 
-  #adoptedBefore(hostId: string, threadId: string, request: AdoptionRequest, scope: JobScope): { job: Job; created: false } | undefined {
+  #adoptedBefore(
+    hostId: string,
+    threadId: string,
+    request: AdoptionRequest,
+    scope: JobScope,
+    markedJobId: string | undefined,
+  ): { job: Job; created: false } | undefined {
     const key = this.idempotencyKey(request.clientId, 'work_adopt', request.requestId);
     if (key) return { job: this.#replayed(key, request, scope), created: false };
-    const existing = this.openJobForThread(threadId, hostId);
+    const marked = markedJobId === undefined ? undefined : this.get(markedJobId);
+    const launching = marked?.hostId === hostId && marked.threadId === null && !isTerminal(marked.state) ? marked : undefined;
+    const existing = this.openJobForThread(threadId, hostId) ?? launching;
     if (!existing) return undefined;
     this.claimIdempotencyKey(request.clientId, 'work_adopt', request.requestId, { inputHash: request.inputHash, jobId: existing.id });
     return { job: existing, created: false };

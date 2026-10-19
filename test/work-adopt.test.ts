@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { describe, test, type TestContext } from 'node:test';
 import { ProtocolErrorCode } from '@modelcontextprotocol/client';
 import { GatewayError } from '../src/errors.ts';
-import { connectAgent, startJob, startJobHarness, type JobHarness, type JobHarnessOptions } from './helpers/jobs.ts';
+import { OPEN_STATES } from '../src/jobs/states.ts';
+import { connectAgent, jobState, startJob, startJobHarness, type JobHarness, type JobHarnessOptions } from './helpers/jobs.ts';
 import { tempDir } from './helpers/tmp.ts';
 
 interface JobView {
@@ -42,6 +43,11 @@ function adopt(h: JobHarness, threadId: string, extra: Record<string, unknown> =
 
 async function harness(t: TestContext, options: JobHarnessOptions = {}): Promise<JobHarness> {
   return startJobHarness(t, options);
+}
+
+async function openJobsFor(h: JobHarness, threadId: string): Promise<string[]> {
+  const { jobs } = await h.agent.call<{ jobs: JobView[] }>('work_list', { states: OPEN_STATES });
+  return jobs.filter((job) => job.threadId === threadId).map((job) => job.jobId);
 }
 
 describe('work_adopt: taking over a thread', () => {
@@ -139,6 +145,71 @@ describe('work_adopt: idempotency and one job per thread', () => {
     const standing = (await h.gw.services.jobs.adopt({ project: 'pilot', threadId: coordinator })).job;
     const viaStanding = await adopt(h, coordinator);
     assert.deepEqual([viaStanding.created, viaStanding.job.jobId, viaStanding.job.standing], [false, standing.id, true]);
+  });
+
+  test('a launch whose answer has not arrived yet is the job that follows its thread', async (t) => {
+    const h = await harness(t);
+    h.fake.holdResponses.add('t3_thread_launch');
+    const launched = await startJob(h.agent);
+    const launching = h.tick();
+    await h.fake.whenHeld('t3_thread_launch');
+    const threadId = h.fake.threadForJob(launched.jobId).threadId;
+    const first = await h.agent.call<Adopted>('work_adopt', { host: 'main', threadId, requestId: 'during-launch' });
+    assert.deepEqual([first.created, first.job.jobId, first.job.state], [false, launched.jobId, 'dispatching']);
+    const replay = await h.agent.call<Adopted>('work_adopt', { host: 'main', threadId, requestId: 'during-launch' });
+    assert.equal(replay.job.jobId, launched.jobId, 'the request id was recorded against the launching job');
+    h.fake.holdResponses.clear();
+    h.fake.releaseHeld();
+    await launching;
+    assert.equal(await jobState(h.agent, launched.jobId), 'running');
+    assert.deepEqual(await openJobsFor(h, threadId), [launched.jobId]);
+  });
+
+  test('a launch whose answer was lost is the job that follows its thread, and reconciliation keeps it the only one', async (t) => {
+    const h = await harness(t);
+    const launched = await startJob(h.agent);
+    h.fake.dropResponseOnce.add('t3_thread_launch');
+    await h.tick();
+    assert.equal(await jobState(h.agent, launched.jobId), 'unknown');
+    const threadId = h.fake.threadForJob(launched.jobId).threadId;
+    const { created, job } = await adopt(h, threadId);
+    assert.deepEqual([created, job.jobId], [false, launched.jobId]);
+    await h.tickAfter(60_000);
+    assert.equal(await jobState(h.agent, launched.jobId), 'running', 'reconciled');
+    assert.deepEqual(await openJobsFor(h, threadId), [launched.jobId]);
+  });
+
+  test('a marker naming a finished job, a job that follows another thread, or no job does not block adoption', async (t) => {
+    const h = await harness(t);
+    const cancelled = await startJob(h.agent);
+    await h.agent.call('work_cancel', { jobId: cancelled.jobId });
+    const running = await startJob(h.agent);
+    await h.tick();
+    assert.deepEqual([await jobState(h.agent, cancelled.jobId), await jobState(h.agent, running.jobId)], ['cancelled', 'running']);
+    for (const marked of [cancelled.jobId, running.jobId, 'synthetic0']) {
+      const threadId = appThread(h, `Synthetic copy [job:${marked}]`);
+      const { created, job } = await adopt(h, threadId);
+      assert.deepEqual([created, job.adopted, job.threadId], [true, true, threadId], marked);
+    }
+  });
+
+  test('a launch confirmed after a person removed its marker and an agent took the thread over ends, naming that job', async (t) => {
+    const h = await harness(t);
+    h.fake.holdResponses.add('t3_thread_launch');
+    const launched = await startJob(h.agent);
+    const launching = h.tick();
+    await h.fake.whenHeld('t3_thread_launch');
+    const thread = h.fake.threadForJob(launched.jobId);
+    thread.title = 'Synthetic title a person typed';
+    const adopted = await adopt(h, thread.threadId);
+    assert.equal(adopted.created, true);
+    h.fake.holdResponses.clear();
+    h.fake.releaseHeld();
+    await launching;
+    const status = await h.agent.call<JobView & { lastError: { code: string; message: string } | null }>('work_status', { jobId: launched.jobId });
+    assert.deepEqual([status.state, status.lastError?.code, status.threadId], ['failed', 'thread_already_followed', thread.threadId]);
+    assert.match(status.lastError!.message, new RegExp(`job ${adopted.job.jobId}`));
+    assert.deepEqual(await openJobsFor(h, thread.threadId), [adopted.job.jobId]);
   });
 
   test('after work_cancel ends the adopted job, the thread can be adopted again as a fresh job', async (t) => {
