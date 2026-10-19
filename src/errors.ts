@@ -23,7 +23,9 @@ export type ErrorCode =
   | 'start_disabled'
   | 'discovery_disabled'
   | 'catalog_limit'
-  | 'internal_error';
+  | 'internal_error'
+  | 'tool_not_allowed'
+  | 'native_reads_disabled';
 
 export class GatewayError extends Error {
   readonly code: ErrorCode;

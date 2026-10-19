@@ -99,6 +99,7 @@ export interface HostView {
   access: string;
   capacity: { max: number; used: number; queued: number; open: number; standingOpen: number };
   discovery: { enabled: boolean; allowWorkStart: boolean; runtimeMode: string };
+  nativeReads: boolean;
   projects: {
     alias: string;
     description: string;
@@ -177,6 +178,7 @@ function hostView(sources: DashboardSources, host: HostConfig, counts: Map<strin
       standingOpen: count(OPEN_STATES, true),
     },
     discovery: { enabled: host.discovery.enabled, allowWorkStart: host.discovery.allowWorkStart, runtimeMode: host.discovery.runtimeMode },
+    nativeReads: host.nativeReads,
     projects: projects.map((project) => ({
       alias: project.alias,
       description: clip(project.description, 500),

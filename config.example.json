@@ -11,7 +11,8 @@
       "access": "full-access",
       "maxConcurrentJobs": 2,
       "defaultModelSelection": { "instanceId": "codex", "model": "example-model-id" },
-      "discovery": { "enabled": false, "allowWorkStart": false, "runtimeMode": "approval-required", "baseRef": "main", "branchPrefix": "fleet/" }
+      "discovery": { "enabled": false, "allowWorkStart": false, "runtimeMode": "approval-required", "baseRef": "main", "branchPrefix": "fleet/" },
+      "nativeReads": true
     }
   ],
   "projects": [
