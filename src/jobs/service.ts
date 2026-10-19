@@ -223,6 +223,11 @@ export function jobMarker(jobId: string): string {
   return `[job:${jobId}]`;
 }
 
+/** The job whose marker ends a thread title (after trimming); a marker anywhere else names no job. */
+export function markedJobId(title: string): string | undefined {
+  return /\[job:([^[\]]+)\]$/.exec(title.trim())?.[1];
+}
+
 /**
  * The job operations behind the work_* tools. Starting a job only records it; the engine
  * (dispatcher and watcher) talks to T3. `wake` lets the engine react at once instead of at its next tick.
@@ -609,7 +614,8 @@ export class JobService {
   /**
    * work_adopt: take over an existing T3 thread as an ordinary job of the calling agent (docs/design.md, "Taking over a
    * thread"). Authorization and the host's nativeReads come before the ledger and T3. A repeated request id, or a
-   * thread an open job already follows, returns that job without asking T3. Nothing is launched, renamed or
+   * thread an open job already follows, returns that job without asking T3; so does a thread whose title carries the
+   * marker of an open job that has no thread yet, once the thread is read. Nothing is launched, renamed or
    * reconfigured; the job starts in the thread's observed state and holds a slot while running, even past the limit.
    */
   async adoptThread(caller: Caller, input: AdoptThreadInput): Promise<{ job: Job; created: boolean }> {
@@ -629,6 +635,10 @@ export class JobService {
     const before = this.store.adoptedBefore(host.id, input.threadId, request, scope);
     if (before) return before;
     const { thread, job } = await this.#observeThread(host.id, input.threadId, false);
+    // A launch T3 has not confirmed yet (dispatching or unknown) has no thread id in the ledger, only its marker in the title.
+    const marked = markedJobId(thread.title);
+    const launching = this.store.adoptedBefore(host.id, input.threadId, request, scope, marked);
+    if (launching) return launching;
     if (thread.archived === true) {
       throw new GatewayError(
         'invalid_argument',
@@ -648,7 +658,7 @@ export class JobService {
     const alias = mapping?.aliases.length === 1 && mapping.ambiguousAliases.length === 0
       ? mapping.aliases[0]!.alias
       : projectRef(host.id, thread.projectId);
-    const result = this.store.adoptForAgent({ ...job, id: newJobId(), projectAlias: alias, title: input.title ?? thread.title }, request, scope);
+    const result = this.store.adoptForAgent({ ...job, id: newJobId(), projectAlias: alias, title: input.title ?? thread.title }, request, scope, marked);
     if (result.created) this.wake();
     return result;
   }

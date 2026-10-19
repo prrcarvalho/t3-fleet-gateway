@@ -13,7 +13,7 @@ import { readActivity, refreshDelegated, scanActivity } from './activity.ts';
 import { EXCERPT_CHARS, isActiveStatus, observe, threadLinkTarget, type ActivityRead } from './derive.ts';
 import { deliverInterrupt } from './interrupt.ts';
 import { validateSelection, type LaunchSpec, type ModelSelection, type Workspace } from './launchSpec.ts';
-import { jobMarker } from './service.ts';
+import { jobMarker, markedJobId } from './service.ts';
 import type { Job, JobChanges, JobStore } from './store.ts';
 import { launchPolicy, mapProjects } from './targets.ts';
 
@@ -551,7 +551,7 @@ export class JobEngine {
     const client = this.#options.registry.client(hostId);
     const marker = jobMarker(jobId);
     // The marker ends the title; one merely mentioned elsewhere in a title is someone else's thread.
-    const carriesMarker = (title: string) => title.trim().endsWith(marker);
+    const carriesMarker = (title: string) => markedJobId(title) === jobId;
     // T3 lists unsettled threads unless asked for settled ones, and a job's thread may be settled already.
     for (const settled of [false, true]) {
       const listed = await client.listThreads({ projectId, titleContains: marker, limit: 10, ...(settled ? { settled } : {}) });
@@ -716,16 +716,10 @@ export class JobEngine {
   async #attach(jobId: string, thread: FoundThread, via: 'launched' | 'reconciled', launchCode: string | null): Promise<void> {
     const { store, registry } = this.#options;
     const { threadLink, status, ...rest } = thread;
-    if (status !== undefined && thread.lastRunId === null && !isActiveStatus(status)) {
-      const changes = {
-        ...rest,
-        ...(threadLink ? { threadLink } : {}),
-        lastErrorCode: 'launch_not_started',
-        lastErrorMessage:
-          `T3 created the job's thread but started no run on it${launchCode ? ` (the launch answered ${launchCode})` : ''}, ` +
-          'so the task was never delivered. The thread is kept for inspection; start a new job if the work is still needed.',
-      };
-      const detail = { reason: 'launch_not_started', code: 'launch_not_started' };
+    const failure = this.#attachFailure(jobId, thread, launchCode);
+    if (failure) {
+      const changes = { ...rest, ...(threadLink ? { threadLink } : {}), lastErrorCode: failure.code, lastErrorMessage: failure.message };
+      const detail = { reason: failure.code, code: failure.code };
       store.transition(jobId, { from: ['dispatching', 'unknown'], to: 'failed', changes, detail });
       store.transition(jobId, { from: ['cancel_requested'], to: 'cancelled', changes, detail });
       return;
@@ -738,6 +732,32 @@ export class JobEngine {
     if (job?.state !== 'cancel_requested') return;
     store.transition(jobId, { from: ['cancel_requested'], to: 'cancel_requested', changes, gatewayTurn });
     await this.#interrupt(jobId, job.hostId, { threadId: thread.threadId, runId: thread.lastRunId }, registry);
+  }
+
+  /**
+   * Why the job cannot take the thread T3 created for it: another open job took it over first (with jobs adopt, or with
+   * work_adopt after a person removed the marker from its title), or no run ever started on it, so the task was never delivered.
+   */
+  #attachFailure(jobId: string, thread: FoundThread, launchCode: string | null): { code: string; message: string } | undefined {
+    const { store } = this.#options;
+    const follower = store.openJobForThread(thread.threadId, store.require(jobId).hostId);
+    if (follower) {
+      return {
+        code: 'thread_already_followed',
+        message:
+          `T3 created the job's thread, but job ${follower.id} took it over before the launch was confirmed. ` +
+          `Follow the work through job ${follower.id}.`,
+      };
+    }
+    if (thread.status !== undefined && thread.lastRunId === null && !isActiveStatus(thread.status)) {
+      return {
+        code: 'launch_not_started',
+        message:
+          `T3 created the job's thread but started no run on it${launchCode ? ` (the launch answered ${launchCode})` : ''}, ` +
+          'so the task was never delivered. The thread is kept for inspection; start a new job if the work is still needed.',
+      };
+    }
+    return undefined;
   }
 
   /** Deliver (or re-deliver) a cancel_requested job's interrupt for one run. T3 deduplicates repeats per run. */
