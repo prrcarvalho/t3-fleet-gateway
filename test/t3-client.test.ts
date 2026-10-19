@@ -88,6 +88,15 @@ describe('T3 client', () => {
     await assert.rejects(client.environmentRead(), (error: unknown) => error instanceof T3ToolError && error.t3Code === 'not_ready');
   });
 
+  test('a call T3 refuses at the protocol level (unknown tool, invalid arguments) is a tool failure, not a lost response', async (t) => {
+    const { client } = await setup(t);
+    await assert.rejects(
+      client.callTool('t3_synthetic_unknown', {}, z.unknown(), { readOnly: true }),
+      (error: unknown) => error instanceof T3ToolError && error.t3Code === 'invalid_params' && /t3_synthetic_unknown/.test(error.message),
+    );
+    assert.ok(await client.environmentRead());
+  });
+
   test('reports a missing or rejected credential', async (t) => {
     const { fake, client, setToken } = await setup(t);
     setToken(undefined);
