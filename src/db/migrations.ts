@@ -323,6 +323,13 @@ ALTER TABLE webhook_subscriptions ADD COLUMN last_test_status_code INTEGER;
     // A build that understands v2 scratch specs but not v3 workspace specs must refuse this ledger.
     sql: 'SELECT 1;',
   },
+  {
+    version: 13,
+    name: 'agent-adopted jobs',
+    // adopted: 1 for a job an agent took over with work_adopt (an existing T3 thread, never launched, standing = 0);
+    // 0 for launched and standing jobs, and for every job before this.
+    sql: 'ALTER TABLE jobs ADD COLUMN adopted INTEGER NOT NULL DEFAULT 0 CHECK (adopted IN (0, 1));',
+  },
 ];
 
 /**
