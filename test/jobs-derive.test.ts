@@ -126,6 +126,15 @@ describe('state derivation', () => {
     assert.deepEqual([seen.state, seen.errorCode], ['failed', 't3_run_failed']);
   });
 
+  test('an idle job already settled on a failed run stays idle with the error; a later failed run fails it', () => {
+    const failedRead = read({ status: 'failed' }, [{ runId: 'run-1', status: 'failed' }]);
+    const settled = observe(job({ state: 'idle', lastRunId: 'run-1' }), failedRead, []);
+    assert.deepEqual([settled.state, settled.errorCode, settled.anotherTurnFinished], ['idle', 't3_run_failed', false]);
+    const newer = read({ status: 'failed', latestRunId: 'run-2' }, [{ runId: 'run-2', status: 'failed' }, { runId: 'run-1', status: 'failed' }]);
+    const later = observe(job({ state: 'idle', lastRunId: 'run-1' }), newer, []);
+    assert.deepEqual([later.state, later.errorCode], ['failed', 't3_run_failed']);
+  });
+
   test('a failed run leaves a standing job idle, with the error', () => {
     const seen = observe(job({ standing: true }), read({ status: 'failed' }, [{ runId: 'run-1', status: 'failed' }]), []);
     assert.deepEqual([seen.state, seen.reason, seen.errorCode, seen.lastRunId], ['idle', 'run_failed', 't3_run_failed', 'run-1']);

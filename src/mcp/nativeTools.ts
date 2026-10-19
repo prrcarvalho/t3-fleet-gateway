@@ -77,7 +77,7 @@ export function nativeTools(deps: NativeToolDeps) {
       'gateway did not start: list and search threads in a project, read a thread\'s messages or activity, its configuration, ' +
       'queue and pending questions, the host\'s projects and worktrees. missing names tools the gateway allows that this host ' +
       'does not offer (an older or newer T3). Writes are never listed: start, continue, answer and cancel work with the work_* ' +
-      'tools. A host the operator opted out fails with native_reads_disabled. Read-only.',
+      'tools, and take over an existing thread with work_adopt. A host the operator opted out fails with native_reads_disabled. Read-only.',
     scope: READ_SCOPE,
     readOnly: true,
     inputSchema: z.object({ host: hostInput }),
@@ -114,8 +114,8 @@ export function nativeTools(deps: NativeToolDeps) {
       't3_thread_search { query, projectId } to search them, or t3_thread_read { threadId, view?, afterPosition?, limit?, maxCharsPerItem? } ' +
       'to read one, including threads a person started in the T3 app. fleet_t3_tools lists the tools and their exact input schemas for ' +
       'the host; T3 checks arguments strictly, and its refusals come back as t3_tool_failed with T3\'s own code. Only those read tools ' +
-      'are accepted (tool_not_allowed otherwise): send, launch, interrupt and answer through the work_* tools. ' +
-      `Results above ${MAX_NATIVE_RESULT_BYTES / 1024} KiB are refused with invalid_argument: ask for less ` +
+      'are accepted (tool_not_allowed otherwise): send, launch, interrupt and answer through the work_* tools, and take a thread ' +
+      `over with work_adopt. Results above ${MAX_NATIVE_RESULT_BYTES / 1024} KiB are refused with invalid_argument: ask for less ` +
       '(a lower limit or maxCharsPerItem) and page. Archived threads are readable by id but T3 does not list or search them. Read-only.',
     scope: READ_SCOPE,
     readOnly: true,
@@ -134,7 +134,7 @@ export function nativeTools(deps: NativeToolDeps) {
         throw new GatewayError(
           'tool_not_allowed',
           `${JSON.stringify(input.tool.slice(0, 100))} is not a T3 read tool this gateway forwards. Writes go through the work_* tools ` +
-            `(work_start, work_continue, work_respond, work_cancel). Allowed: ${[...NATIVE_READ_TOOLS.keys()].join(', ')}.`,
+            `(work_start, work_adopt, work_continue, work_respond, work_cancel). Allowed: ${[...NATIVE_READ_TOOLS.keys()].join(', ')}.`,
         );
       }
       const host = nativeHost(deps, context, input.host);

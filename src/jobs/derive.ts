@@ -197,7 +197,8 @@ function parseTime(value: string | undefined): number | null {
  *    of those statuses.
  * 4. `failed` when the turn ended with the latest run (or the thread) `failed`. A standing job is a
  *    long-lived thread that takes the next instruction after a failed run too, so it becomes `idle`
- *    instead, with the same error code.
+ *    instead, with the same error code; so does an idle job whose latest run is the one it already
+ *    settled on (a thread adopted after its run failed: that failure is not the job's).
  * 5. Otherwise `idle`: the turn is over (completed, interrupted, cancelled, rolled back, or a thread
  *    with no run) and the thread is waiting for its next instruction, or (reason
  *    `waiting_on_delegated_work`) for work it delegated, after which T3 starts its next turn by itself.
@@ -228,7 +229,8 @@ export function observe(job: ObservedJob, read: ThreadRead, pendingQuestionIds: 
     state = 'running';
     if (job.state === 'idle') reason = 'turn_started';
   } else if ((latest?.status ?? thread.status) === 'failed' || thread.status === 'failed') {
-    state = job.standing ? 'idle' : 'failed';
+    const settled = job.state === 'idle' && latest !== undefined && latest.runId === job.lastRunId;
+    state = job.standing || settled ? 'idle' : 'failed';
     reason = 'run_failed';
     errorCode = 't3_run_failed';
   } else {
