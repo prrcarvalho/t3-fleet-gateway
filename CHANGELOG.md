@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- `fleet_models` and explicit `modelSelection` accept the compact model-option shape current T3 Code nightlies return from `orchestrator_capabilities` (`{ id, values, default? }`). String `values` are listed as a select option with those choices and the advertised default; boolean `values` (such as `fastMode`) are listed as a boolean option. The older descriptor shape (`id`, `label`, `type`, `options`, `currentValue`) is unchanged. An option entry that matches neither shape is omitted from that model, so one odd entry no longer makes the host's whole catalog fail with `t3_invalid_response` ("orchestrator_capabilities returned an unexpected result shape" at `options[].label` / `options[].type`). A `work_start` that passes `modelSelection` can be checked against the catalog again.
 - T3's JSON-RPC refusals (invalid arguments, unknown tool) are reported as `t3_tool_failed` with `invalid_params` or `method_not_found` instead of a lost response that reset the T3 session.
 - A job that is already `idle` on a run that failed stays `idle` when it is next checked (a thread taken over after its run failed would otherwise fail at once).
 

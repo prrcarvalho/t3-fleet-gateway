@@ -1,0 +1,438 @@
+[
+ {
+  "providerInstanceId": "codex_d5194ff1-d9a2-44be-b4a7-42b3615dddc9",
+  "driverKind": "codex",
+  "displayName": "ChatGPT - Personal2",
+  "models": [
+   {
+    "id": "gpt-6.1-sol",
+    "options": [
+     {
+      "id": "reasoningEffort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max",
+       "ultra"
+      ],
+      "default": "low"
+     }
+    ]
+   },
+   {
+    "id": "gpt-6-astra",
+    "options": [
+     {
+      "id": "reasoningEffort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max",
+       "ultra"
+      ],
+      "default": "medium"
+     }
+    ]
+   },
+   {
+    "id": "gpt-6-sol",
+    "options": [
+     {
+      "id": "reasoningEffort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max",
+       "ultra"
+      ],
+      "default": "medium"
+     }
+    ]
+   },
+   {
+    "id": "gpt-6-luna",
+    "options": [
+     {
+      "id": "reasoningEffort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max"
+      ],
+      "default": "medium"
+     }
+    ]
+   },
+   {
+    "id": "gpt-5.6-sol",
+    "options": [
+     {
+      "id": "reasoningEffort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max",
+       "ultra"
+      ],
+      "default": "low"
+     }
+    ]
+   },
+   {
+    "id": "gpt-5.6-terra",
+    "options": [
+     {
+      "id": "reasoningEffort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max",
+       "ultra"
+      ],
+      "default": "medium"
+     }
+    ]
+   },
+   {
+    "id": "gpt-5.6-luna",
+    "options": [
+     {
+      "id": "reasoningEffort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max"
+      ],
+      "default": "medium"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "providerInstanceId": "codex",
+  "driverKind": "codex",
+  "displayName": "Codex",
+  "models": [
+   {
+    "id": "gpt-6.1-sol",
+    "options": [
+     {
+      "id": "reasoningEffort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max",
+       "ultra"
+      ],
+      "default": "low"
+     },
+     {
+      "id": "serviceTier",
+      "values": [
+       "default",
+       "priority"
+      ],
+      "default": "default"
+     }
+    ]
+   },
+   {
+    "id": "gpt-6-astra",
+    "options": [
+     {
+      "id": "reasoningEffort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max",
+       "ultra"
+      ],
+      "default": "medium"
+     },
+     {
+      "id": "serviceTier",
+      "values": [
+       "default",
+       "priority"
+      ],
+      "default": "default"
+     }
+    ]
+   },
+   {
+    "id": "gpt-6-luna",
+    "options": [
+     {
+      "id": "reasoningEffort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max"
+      ],
+      "default": "medium"
+     },
+     {
+      "id": "serviceTier",
+      "values": [
+       "default",
+       "priority"
+      ],
+      "default": "default"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "providerInstanceId": "claude",
+  "driverKind": "claudeAgent",
+  "displayName": "Claude",
+  "models": [
+   {
+    "id": "claude-opus-5-5",
+    "label": "Claude Opus 5.5",
+    "options": [
+     {
+      "id": "effort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max",
+       "ultracode",
+       "ultrathink"
+      ],
+      "default": "medium"
+     },
+     {
+      "id": "fastMode",
+      "values": [
+       false,
+       true
+      ]
+     }
+    ]
+   },
+   {
+    "id": "claude-sonnet-5-5",
+    "label": "Claude Sonnet 5.5",
+    "options": [
+     {
+      "id": "effort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max",
+       "ultrathink"
+      ],
+      "default": "high"
+     }
+    ]
+   },
+   {
+    "id": "claude-fable-5-1",
+    "label": "Claude Fable 5.1",
+    "options": [
+     {
+      "id": "effort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max",
+       "ultracode",
+       "ultrathink"
+      ],
+      "default": "medium"
+     }
+    ]
+   },
+   {
+    "id": "claude-haiku-5-5",
+    "label": "Claude Haiku 5.5",
+    "options": [
+     {
+      "id": "effort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max",
+       "ultrathink"
+      ],
+      "default": "medium"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "providerInstanceId": "claudeAgent",
+  "driverKind": "claudeAgent",
+  "displayName": "Claudex",
+  "models": [
+   {
+    "id": "claude-opus-5-5",
+    "label": "Claude Opus 5.5",
+    "options": [
+     {
+      "id": "effort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max",
+       "ultracode",
+       "ultrathink"
+      ],
+      "default": "medium"
+     },
+     {
+      "id": "fastMode",
+      "values": [
+       false,
+       true
+      ]
+     }
+    ]
+   },
+   {
+    "id": "claude-sonnet-5-5",
+    "label": "Claude Sonnet 5.5",
+    "options": [
+     {
+      "id": "effort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max",
+       "ultrathink"
+      ],
+      "default": "high"
+     }
+    ]
+   },
+   {
+    "id": "claude-fable-5-1",
+    "label": "Claude Fable 5.1",
+    "options": [
+     {
+      "id": "effort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max",
+       "ultracode",
+       "ultrathink"
+      ],
+      "default": "medium"
+     }
+    ]
+   },
+   {
+    "id": "claude-haiku-5-5",
+    "label": "Claude Haiku 5.5",
+    "options": [
+     {
+      "id": "effort",
+      "values": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max",
+       "ultrathink"
+      ],
+      "default": "medium"
+     }
+    ]
+   },
+   {
+    "id": "gpt-5.6-sol"
+   },
+   {
+    "id": "gpt-5.6-terra"
+   },
+   {
+    "id": "gpt-5.6-luna"
+   }
+  ]
+ },
+ {
+  "providerInstanceId": "cursor",
+  "driverKind": "cursor",
+  "displayName": "Cursor",
+  "models": []
+ },
+ {
+  "providerInstanceId": "grok",
+  "driverKind": "grok",
+  "displayName": "Grok",
+  "models": [
+   {
+    "id": "grok-build",
+    "label": "Grok Build"
+   }
+  ]
+ },
+ {
+  "providerInstanceId": "opencode",
+  "driverKind": "opencode",
+  "displayName": "OpenCode",
+  "models": []
+ },
+ {
+  "providerInstanceId": "antigravity",
+  "driverKind": "antigravity",
+  "displayName": "Antigravity",
+  "models": []
+ },
+ {
+  "providerInstanceId": "muse",
+  "driverKind": "muse",
+  "displayName": "Muse Code",
+  "models": []
+ },
+ {
+  "providerInstanceId": "pi",
+  "driverKind": "pi",
+  "displayName": "Pi",
+  "models": [
+   {
+    "id": "default",
+    "label": "Pi default"
+   }
+  ]
+ }
+]
