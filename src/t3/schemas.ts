@@ -23,9 +23,9 @@ export const projectListSchema = z.looseObject({
 });
 
 /**
- * One model option T3 advertises in `orchestrator_capabilities` (T3's `ProviderOptionDescriptor`): a
- * `select` with its choices (a reasoning effort, say) or a `boolean`. The type is read as a plain
- * string so a kind added by a newer T3 is carried, unselectable, instead of failing the whole catalog.
+ * One model option after recognition, in the descriptor shape the rest of the gateway already uses.
+ * `type` stays a plain string so a kind this gateway cannot select is listed, not a catalog failure.
+ * `select` carries `options` (the choices); `boolean` uses `currentValue` when T3 reports one.
  */
 export const optionDescriptorSchema = z.looseObject({
   id: z.string().min(1),
@@ -39,6 +39,98 @@ export const optionDescriptorSchema = z.looseObject({
 });
 export type OptionDescriptor = z.infer<typeof optionDescriptorSchema>;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A descriptor-shaped choice. An entry without a usable id and label is omitted; the option stays.
+ * `isDefault` is only kept when T3 actually sent `true` (a missing flag is not a default).
+ */
+function normalizeChoice(value: unknown): { id: string; label: string; description: string | null; isDefault: boolean } | undefined {
+  if (!isRecord(value) || typeof value.id !== 'string' || value.id.length === 0 || typeof value.label !== 'string') return undefined;
+  return {
+    id: value.id,
+    label: value.label,
+    description: typeof value.description === 'string' ? value.description : null,
+    isDefault: value.isDefault === true,
+  };
+}
+
+/**
+ * Older T3: `{ id, label, type, description?, options?: [{ id, label, description?, isDefault? }], currentValue? }`.
+ * A choice that is not that shape is dropped. `currentValue` is kept only when it is a string or boolean,
+ * so `false` survives and a non-scalar does not reject the option.
+ */
+function normalizeDescriptor(value: Record<string, unknown>): OptionDescriptor {
+  const choices = Array.isArray(value.options) ? value.options.flatMap((entry) => {
+    const choice = normalizeChoice(entry);
+    return choice ? [choice] : [];
+  }) : [];
+  const current = value.currentValue;
+  return {
+    id: value.id as string,
+    label: value.label as string,
+    description: typeof value.description === 'string' ? value.description : null,
+    type: value.type as string,
+    options: choices,
+    currentValue: typeof current === 'string' || typeof current === 'boolean' ? current : null,
+  };
+}
+
+/**
+ * Current T3 nightlies: `{ id, values, default? }`. Every value a boolean means a boolean option
+ * (`default` is the current value when it is a boolean; `values` recognizes the type and is not an
+ * allowlist). Every value a non-empty string means a select option; the choices are those strings in
+ * order, duplicates removed, and `default` marks a choice when it is one of them. A mixed or empty
+ * list is not a recognized option.
+ */
+function normalizeCompact(value: Record<string, unknown>): OptionDescriptor | undefined {
+  if (typeof value.id !== 'string' || value.id.length === 0 || !Array.isArray(value.values) || value.values.length === 0) return undefined;
+  const label = typeof value.label === 'string' ? value.label : value.id;
+  const description = typeof value.description === 'string' ? value.description : null;
+  if (value.values.every((entry) => typeof entry === 'boolean')) {
+    return {
+      id: value.id,
+      label,
+      description,
+      type: 'boolean',
+      options: null,
+      currentValue: typeof value.default === 'boolean' ? value.default : null,
+    };
+  }
+  if (!value.values.every((entry) => typeof entry === 'string' && entry.length > 0)) return undefined;
+  const seen = new Set<string>();
+  const options = [];
+  for (const entry of value.values) {
+    if (typeof entry !== 'string' || seen.has(entry)) continue;
+    seen.add(entry);
+    options.push({ id: entry, label: entry, description: null, isDefault: value.default === entry });
+  }
+  return { id: value.id, label, description, type: 'select', options, currentValue: null };
+}
+
+/**
+ * One advertised option, or nothing when the entry matches neither shape. Descriptor wins when `type`
+ * and `label` are both strings, so an older payload is unchanged even if it also carries `values`.
+ */
+function normalizeAdvertisedOption(value: unknown): OptionDescriptor | undefined {
+  if (!isRecord(value)) return undefined;
+  const descriptor = typeof value.id === 'string' && value.id.length > 0
+    && typeof value.type === 'string' && value.type.length > 0
+    && typeof value.label === 'string';
+  return descriptor ? normalizeDescriptor(value) : normalizeCompact(value);
+}
+
+/** Keep recognized options, in order. A missing or non-array `options` field is no options, not a catalog failure. */
+function normalizeAdvertisedOptions(value: unknown): OptionDescriptor[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const option = normalizeAdvertisedOption(entry);
+    return option ? [option] : [];
+  });
+}
+
 /** The fields of `orchestrator_capabilities` the gateway relies on; T3's result has more (features, inherited model). */
 export const capabilitiesSchema = z.looseObject({
   providers: z.array(
@@ -46,7 +138,16 @@ export const capabilitiesSchema = z.looseObject({
       providerInstanceId: z.string().min(1),
       driverKind: z.string(),
       displayName: z.string().nullish(),
-      models: z.array(z.looseObject({ id: z.string().min(1), label: z.string().nullish(), options: z.array(optionDescriptorSchema).nullish() })),
+      models: z.array(z.looseObject({
+        id: z.string().min(1),
+        label: z.string().nullish(),
+        /**
+         * Each entry is normalized before the descriptor schema sees it. An entry that is neither the
+         * descriptor shape nor the compact `{ id, values, default? }` shape is omitted, so one odd
+         * option does not make the host's catalog `t3_invalid_response`.
+         */
+        options: z.preprocess(normalizeAdvertisedOptions, z.array(optionDescriptorSchema)).optional(),
+      })),
       runtimeModes: z.array(z.string()).nullish(),
       /** Whether this provider may run a delegated child task inside T3: metadata, not proof that a top-level launch works. */
       canRunChildTask: z.boolean().nullish(),

@@ -51,7 +51,10 @@ export interface FakeItem {
   title?: string | null;
 }
 
-/** A model option as T3 advertises it in orchestrator_capabilities (a `select` with choices, or a `boolean`). */
+/**
+ * A model option as older T3 builds advertise it in orchestrator_capabilities (a `select` with choices, or a `boolean`).
+ * Current nightlies send `{ id, values, default? }` instead; a test that needs that payload assigns it to `providers`.
+ */
 export interface FakeOption {
   id: string;
   label: string;

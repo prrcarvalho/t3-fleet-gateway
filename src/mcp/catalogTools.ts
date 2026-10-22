@@ -73,15 +73,22 @@ const projectsOutput = z.object({
   hosts: z.array(z.object({ ...hostBase, projects: z.array(projectSchema) })),
 });
 
-const choiceSchema = z.object({ id: z.string(), label: z.string(), description: z.string().nullable(), isDefault: z.boolean() });
+const choiceSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  description: z.string().nullable(),
+  isDefault: z.boolean().describe("True for the choice T3 marks as the default (a descriptor's isDefault, or the compact shape's default)"),
+});
 
 const optionSchema = z.object({
   id: z.string().describe('The option id to use as a key in modelSelection.options'),
-  label: z.string(),
+  label: z.string().describe("T3's label, or the option id when the compact shape has no label"),
   description: z.string().nullable(),
   type: z.string().describe("select: pass one of choices[].id; boolean: pass true or false. Any other type is listed but cannot be selected"),
   choices: z.array(choiceSchema).nullable().describe('The complete list of values a select option takes (T3 advertises them; nothing is omitted)'),
-  currentValue: z.union([z.string(), z.boolean()]).nullable().describe("T3's current value where it reports one"),
+  currentValue: z.union([z.string(), z.boolean()]).nullable().describe(
+    "The descriptor shape's current value, or the advertised default of a compact boolean option. Compact select options mark their default with choices[].isDefault and leave this null",
+  ),
 });
 
 const providerSchema = z.object({
@@ -366,7 +373,10 @@ export function catalogTools(deps: CatalogToolDeps) {
       'List the provider instances, models and model options (such as a reasoning effort) each host advertises, on hosts where the ' +
       'operator enabled discovery, read live from that host\'s T3. Use it to build a modelSelection for work_start: ' +
       'instanceId = providerInstanceId, model = modelId, and options = { <option id>: <a choices[].id for select options, true or ' +
-      'false for boolean options> }. Only what a host advertises is accepted there; a selection the host does not advertise is refused ' +
+      'false for boolean options> }. T3 may describe an option as a descriptor (id, label, type, choices, current value) or compactly ' +
+      '(id, values, default): string values are listed as a select option and its choices, with the default marked, and boolean values ' +
+      'as a boolean option. An option entry of some other shape is left out of that model; the rest of the catalog is still listed. ' +
+      'Only what a host advertises is accepted there; a selection the host does not advertise is refused ' +
       'rather than substituted, and omitting modelSelection keeps the configured defaults (project, then host, then the T3 project ' +
       'default). Providers that advertise no models are listed under providers with modelCount 0. canRunChildTask and constraints are ' +
       "T3's own metadata about delegated child tasks, not proof that a launch with that provider works. Unavailable hosts are listed " +
