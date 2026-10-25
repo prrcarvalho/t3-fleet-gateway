@@ -18,7 +18,6 @@ import { MAX_PROJECT_PAGES, PROJECT_PAGE_SIZE } from '../t3/client.ts';
 import { effectivePolicy, launchPolicy, mapProjects, type EffectivePolicy } from '../jobs/targets.ts';
 import { permits, READ_SCOPE } from '../oauth/scopes.ts';
 import { isoTime } from '../time.ts';
-import { readableHost } from './hostAccess.ts';
 import { defineTool, type ToolContext } from './tools.ts';
 
 export const DEFAULT_PAGE = 50;
@@ -52,7 +51,7 @@ const launchSchema = z.object({
   alias: z.string().nullable().describe('The configured alias to pass as project; null when none (use target) or ambiguous'),
   aliases: z.array(z.string()).describe('Every configured alias that maps to this project'),
   runtimeMode: z.string().nullable(),
-  workspaceMode: z.enum(['scratch', 'auto']).nullable(),
+  workspaceMode: z.enum(['scratch', 'worktree']).nullable(),
   baseRef: z.string().nullable(),
   branchPrefix: z.string().nullable(),
   defaultModelSource: z.enum(['explicit', 'project', 'host', 't3_default']).nullable().describe(
@@ -135,7 +134,9 @@ function targetHosts(deps: CatalogToolDeps, context: ToolContext, input: z.outpu
   if (input.cursor !== undefined && input.host === undefined) throw new GatewayError('invalid_argument', 'A cursor continues one host: pass host with it.');
   if (input.cursor !== undefined && input.refresh === true) throw new GatewayError('invalid_argument', 'Pass refresh or cursor, not both.');
   if (input.host === undefined) return deps.config.hosts.filter((host) => permits(context.scopes, 'read', host.id));
-  return [readableHost(deps.config, context, input.host)];
+  const host = deps.config.hosts.find((candidate) => candidate.id === input.host);
+  if (!host || !permits(context.scopes, 'read', host.id)) throw new GatewayError('not_found', `No host "${input.host}". fleet_status lists the hosts you can use.`);
+  return [host];
 }
 
 /**
@@ -208,7 +209,15 @@ function disabled(host: HostConfig) {
   };
 }
 
-function guidance(project: CatalogProject, host: string, policy: EffectivePolicy): string {
+/** How a launch into a named project gets its workspace, for the guidance text. */
+function workspaceText(policy: EffectivePolicy, choosesWorkspace: boolean): string {
+  if (policy.workspaceMode === 'scratch') return 'T3 internal scratch';
+  return choosesWorkspace
+    ? `the host picks the workspace: a repository gets a fresh worktree from the up-to-date remote ${policy.baseRef}, any other folder is used as it is; work_start workspace overrides`
+    : `base ${policy.baseRef}`;
+}
+
+function guidance(project: CatalogProject, host: string, policy: EffectivePolicy, choosesWorkspace: boolean): string {
   if (policy.source === 'ambiguous') {
     return `Configured under aliases ${policy.aliases.join(', ')}: start work with work_start { project: <one of them> }, not with target.`;
   }
@@ -219,13 +228,12 @@ function guidance(project: CatalogProject, host: string, policy: EffectivePolicy
     if (!policy.allowWorkStart) {
       return `Configured as project "${policy.alias}", which does not accept work_start: send work to its standing jobs with work_continue (fleet_status lists them).`;
     }
-    const workspace = policy.workspaceMode === 'scratch' ? 'T3 internal scratch' : 'automatic Git detection, wt from updated origin/main or local non-Git folder; workspace root selects the local checkout';
-    return `Start work with work_start { project: ${JSON.stringify(policy.alias)} } (${policy.runtimeMode}, ${workspace}).${model}`;
+    return `Start work with work_start { project: ${JSON.stringify(policy.alias)} } (${policy.runtimeMode}, ${workspaceText(policy, choosesWorkspace)}).${model}`;
   }
   if (!policy.allowWorkStart) {
     return `No configured alias, and host ${host} does not accept work_start into unconfigured projects. Ask the operator to configure it or to enable discovery launches.`;
   }
-  return `Start work with work_start { target: { host: ${JSON.stringify(host)}, projectId: ${JSON.stringify(project.id)} } } (${policy.runtimeMode}, automatic Git detection, wt from updated origin/main or local non-Git folder).${model}`;
+  return `Start work with work_start { target: { host: ${JSON.stringify(host)}, projectId: ${JSON.stringify(project.id)} } } (${policy.runtimeMode}, ${workspaceText(policy, choosesWorkspace)}).${model}`;
 }
 
 function projectViews(deps: CatalogToolDeps, host: HostConfig, projects: readonly CatalogProject[], all: readonly CatalogProject[]): ProjectView[] {
@@ -249,7 +257,7 @@ function projectViews(deps: CatalogToolDeps, host: HostConfig, projects: readonl
         branchPrefix: policy.branchPrefix,
         defaultModelSource: policy.defaultModelSource,
       },
-      guidance: guidance(project, host.id, policy),
+      guidance: guidance(project, host.id, policy, host.workspaceProbeCommand !== undefined),
     };
   });
 }

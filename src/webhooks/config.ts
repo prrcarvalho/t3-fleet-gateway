@@ -4,9 +4,9 @@ import { join } from 'node:path';
 import * as z from 'zod';
 import { GatewayError } from '../errors.ts';
 
-export const WEBHOOK_EVENTS = ['needs_input', 'idle', 'failed', 'cancelled', 'delegated_work_ended', 'running'] as const;
+export const WEBHOOK_EVENTS = ['needs_input', 'idle', 'failed', 'cancelled', 'delegated_work_ended', 'running', 'pull_request_opened', 'pull_request_merged'] as const;
 export type WebhookEventType = (typeof WEBHOOK_EVENTS)[number];
-export const DEFAULT_WEBHOOK_EVENTS = WEBHOOK_EVENTS.filter((event) => event !== 'running');
+export const DEFAULT_WEBHOOK_EVENTS: WebhookEventType[] = ['needs_input', 'idle', 'failed', 'cancelled', 'delegated_work_ended'];
 const BLOCKED_HEADERS = new Set([
   'host', 'connection', 'content-length', 'content-type', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'expect',
   'content-encoding', 'content-range', 'http2-settings', 'accept', 'accept-encoding', 'origin', 'referer', 'user-agent', 'via', 'forwarded', 'keep-alive',
@@ -37,6 +37,8 @@ const subscriptionSchema = z.strictObject({
   }),
   projects: z.array(z.string().min(1).max(300)).min(1).max(100).optional(),
   hosts: z.array(z.string().regex(/^[a-z0-9][a-z0-9-]{0,31}$/)).min(1).max(100).optional(),
+  targets: z.array(z.strictObject({ host: z.string().regex(/^[a-z0-9][a-z0-9-]{0,31}$/),
+    projectId: z.string().min(1).max(300) })).min(1).max(100).optional(),
   events: z.array(z.enum(WEBHOOK_EVENTS)).min(1).max(WEBHOOK_EVENTS.length).default(DEFAULT_WEBHOOK_EVENTS),
   excerptChars: z.int().min(0).max(500).default(0),
   allowLoopbackHttp: z.boolean().default(false),

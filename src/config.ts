@@ -84,6 +84,11 @@ const hostSchema = z.strictObject({
   mintPairingCode: z.array(z.string().min(1)).min(1).default(DEFAULT_MINT_COMMAND),
   /** Operator asserts this exact argv is non-mutating; never inferred from the mint command. */
   mintPairingCodeProbe: z.array(z.string().min(1).max(4096)).min(1).max(32).optional(),
+  /**
+   * Opts the host into automatic workspace selection for named projects: this exact argv is run (no shell) with one JSON
+   * object on stdin and prints one JSON object (docs/configuration.md, "Workspace probe"). Without it, named projects
+   * launch exactly as before: a fresh worktree on the project's baseRef, from the local branch.
+   */
   workspaceProbeCommand: z.array(z.string().min(1).max(4096)).min(1).max(32).optional(),
   access: z.enum(T3_ACCESS_LEVELS).default('auto'),
   maxConcurrentJobs: z.int().min(1).max(32).default(2),
@@ -92,8 +97,8 @@ const hostSchema = z.strictObject({
   discovery: discoverySchema.default(DEFAULT_DISCOVERY),
   /**
    * Agents may read this host's T3 directly through fleet_t3_tools and fleet_t3_call (an in-code allowlist of
-   * T3's read tools, every thread on the host included) and take over its threads with work_adopt. On unless
-   * the operator opts the host out; independent of discovery.
+   * T3's read tools, every thread on the host included). On unless the operator opts the host out. Independent
+   * of discovery. work_adopt is upstream's thread-adoption tool and does not use this flag.
    */
   nativeReads: z.boolean().default(true),
 });
@@ -192,6 +197,9 @@ const configSchema = z
         checkEveryMinutes: z.int().min(1).max(1440).default(60),
       })
       .default({ renewWhenDaysLeft: 5, checkEveryMinutes: 60 }),
+    reachability: z
+      .strictObject({ intervalMinutes: z.int().min(1).max(60).default(5) })
+      .default({ intervalMinutes: 5 }),
     watcher: z
       .strictObject({
         pollSeconds: z.int().min(2).max(300).default(10),
@@ -235,6 +243,18 @@ const configSchema = z
       const project = config.projects.find((candidate) => candidate.alias === host.defaultProject);
       if (!project || project.host !== host.id || project.workspaceMode !== 'scratch') {
         ctx.addIssue({ code: 'custom', path: ['hosts', index, 'defaultProject'], message: 'defaultProject must name a configured scratch alias on this host' });
+      }
+    });
+    // A scratch pin is T3's scratch project: a worktree alias on the same id would put branches there and make a launch's policy depend on which alias is named.
+    config.projects.forEach((project, index) => {
+      if (project.workspaceMode !== 'scratch') return;
+      const shared = config.projects.find((other) => other !== project && other.workspaceMode !== 'scratch' && other.host === project.host && other.t3ProjectId === project.t3ProjectId);
+      if (shared) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['projects', index, 't3ProjectId'],
+          message: `scratch alias "${project.alias}" shares its pinned T3 project with non-scratch alias "${shared.alias}" on host "${project.host}"; a scratch pin must be used by scratch aliases only`,
+        });
       }
     });
     const aliases = new Set<string>();

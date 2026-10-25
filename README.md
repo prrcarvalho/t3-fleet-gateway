@@ -4,7 +4,7 @@
 
 Ask your bot to get something done. Let [T3 Code](https://github.com/pingdotgg/t3code) do the coding on your machines.
 
-T3 Fleet Gateway connects Grok Bot, Notion and other MCP clients to your T3 servers through one connection. Your agent can find projects, start work, answer worker questions and bring back the result. Each new job gets a T3 thread. Named projects use a fresh git worktree and branch; an optional machine default sends work with no named project to T3's internal scratch workspace, shown as "No project". You can open the thread in T3 whenever you want.
+T3 Fleet Gateway connects Grok Bot, Notion and other MCP clients to your T3 servers through one connection. Your agent can find projects, start work, answer worker questions and bring back the result. Each new job gets a T3 thread you can open in T3 whenever you want: a named project's job gets its own git worktree and branch, and work with no named project can run in a machine's T3 scratch workspace.
 
 ![A bot connects to one gateway, which routes coding work to T3 projects on several machines.](docs/images/architecture.svg)
 
@@ -15,7 +15,7 @@ T3 Fleet Gateway connects Grok Bot, Notion and other MCP clients to your T3 serv
 
 ## Get going with prompts
 
-You need an always-on machine with Node.js 24+, a running T3 Code server and its `t3` CLI. A coding agent on that machine can do the setup. The gateway runs from a Git checkout; it is not published to npm.
+You need an always-on machine with Node.js 24.22.1+ on 24.x or 26.12.1+ (older releases do not block the [compromised eMudhra intermediates](docs/security.md#compromised-emudhra-intermediates)), a running T3 Code server and its `t3` CLI. A coding agent on that machine can do the setup. The gateway runs from a Git checkout; it is not published to npm.
 
 ### 1. Ask your coding agent to set up the gateway
 
@@ -67,6 +67,12 @@ review. Don't merge or deploy it.
 ```
 
 > **What happens next:** the gateway starts a T3 thread in a fresh worktree, tracks it, and lets your bot read the result. Worker questions can come back through the bot. Permission approvals still need your click in T3; [unattended projects](docs/configuration.md#approvals-and-unattended-projects) can use a different runtime mode.
+
+## Settle finished work
+
+When review is complete, your bot can call `work_settle({ jobId, requestId })` with a unique request ID. It needs Operate access. The job must be idle, cancelled, failed or released, with no running turn, queued user messages or active delegated work. The gateway checks T3 first and confirms settlement by reading it back. `work_status` reports `settled` and `settledAt`; `work_feed` emits `thread_settled`.
+
+Settling parks the thread, clears its pin, ends PR watches and detaches provider sessions. It does not archive the thread or change the job state. `work_continue` can resume a settled idle job; T3 clears settlement when it accepts the message. Terminal jobs keep their existing behavior. If the host credential cannot settle the thread, the tool returns `t3_unauthorized`; ask the operator to review its T3 access. [Settlement checks, retry rules and bounds](docs/design.md#thread-settlement).
 
 ## Give your bot a doorbell 🔔
 
@@ -121,6 +127,20 @@ Open your private dashboard to see which machines answer, which agents have conn
 
 The dashboard uses a separate loopback listener and belongs behind your private tailnet proxy. Your public MCP URL is for agents. [Dashboard setup and access](docs/operations.md#operator-dashboard).
 
+## Follow a job's pull requests
+
+Ask your bot:
+
+```text
+Which PRs came out of that job? Show me what's open and what's merged.
+```
+
+`work_status` and `work_list` include cached PR links and states, even for text-only clients: up to 20 per job, open ones first and then the newest. A job follows up to 200 PRs, so a merge among the others is still noticed, and the text says so when it shows only part (`20 of 35 shown`). The dashboard shows a small **PR #21 open** badge beside the job. Workers need to register their PR with T3's `link_pull_request`; a coordinator should link its children's PRs too.
+
+> **What this means:** you can follow the result of a job without searching GitHub. PRs refresh about once a minute while the job is followed, on top of T3's own sync delay. Unknown means not yet readable; a finished or released job keeps its last snapshot.
+
+Want your bot to wake when a PR opens or merges? Add `pull_request_opened` and `pull_request_merged` to a [configured webhook subscription](docs/configuration.md#webhooks). These are opt-in; dashboard connections keep their existing five events.
+
 ## Discover projects and choose models
 
 Discovery is off by default: agents see the aliases you configured. To browse a machine's existing T3 projects and available models, ask your setup agent:
@@ -140,29 +160,35 @@ and the models and reasoning efforts it offers. For my next job in
 
 Browsing and launching are separate choices. To launch into projects without aliases, explicitly enable that host's discovery launch policy. Existing aliases keep their restrictions; model choices must match what T3 advertises. [Discovery settings](docs/configuration.md#discovery).
 
-## Work without a project
+## Start work with no named project
 
-Configure a scratch alias with `workspaceMode: "scratch"` and the verified ID of the machine's internal T3 scratch project. Set the host's `defaultProject` to that alias and enable discovery. The [configuration guide](docs/configuration.md#no-named-project) includes an example and upgrade instructions.
-
-When the user names no project, the agent passes `target: { host: "machine-a" }` to `work_start`. An explicit project still uses its alias or project ID. An unknown named project must be resolved rather than sent to scratch. Existing aliases keep their worktree behavior unless explicitly changed.
-
-## Read any thread, take one over
-
-Your bot can read every T3 thread on a machine, not only the jobs it started: threads you opened in the T3 app too. `fleet_t3_tools` lists the T3 read tools a machine offers, with their arguments, and `fleet_t3_call` runs one. Ask your bot:
+Some requests name a machine but no project. A machine can have a default **scratch** destination: T3's internal "No project" workspace, with no git worktree or branch. Named projects are unchanged and still get a fresh worktree per job. Ask your setup agent:
 
 ```text
-On host <id>, use fleet_t3_tools, then fleet_t3_call with t3_thread_search
-to find my thread about <topic>. Read its latest messages and summarize them.
+On gateway host <id>, add a scratch alias for T3's internal "No project"
+workspace and make it the host's default project. Verify that project's
+ID in T3 first; don't guess it from the title. Then restart and run
+doctor.
 ```
 
-Only T3's read tools pass through; writes still go through the `work_*` tools. To have the bot drive that thread from now on, ask it to take it over:
+When you name a machine but no project, your bot passes `target: { host: "<id>" }` to `work_start`. An explicit project still uses its alias or project ID, and an unknown named project is resolved or reported, never sent to scratch. The scratch default needs no discovery. Enabling discovery lets agents with Read access browse that machine's T3 projects and models; launching into projects without an alias stays off unless you enable it separately. [Scratch configuration and upgrade notes](docs/configuration.md#no-named-project).
+
+## Work in a project's own folder
+
+By default every job in a named project gets a fresh git worktree and branch. Some project folders aren't git repositories, and sometimes you want a job to work in the project's own folder. Turn on workspace selection for a machine and the gateway chooses per job, when it launches: a git repository root still gets a fresh worktree, started from the freshly fetched `origin/<baseRef>`, and any other folder runs in place. Ask your setup agent:
 
 ```text
-Take over that thread with work_adopt, then tell it to <next instruction>
-with work_continue. Report back when it finishes.
+On gateway host <id>, enable workspace selection with the reference
+workspace probe (scripts/workspace-probe.js). Restart and run doctor.
 ```
 
-The adopted thread becomes one of the bot's jobs, in whatever state it is in now, and is followed like any other job; nothing in T3 is renamed or reconfigured. Archived threads cannot be taken over. Native reads are on for every machine by default; set `"nativeReads": false` on a host to keep its threads to yourself. [Native reads](docs/configuration.md#native-reads), [what they expose](docs/security.md).
+Your bot can also ask for a workspace with `work_start`'s `workspace`: `{ "type": "root" }` for the project's own folder, or `{ "type": "worktree" }` to insist on a worktree. Only one gateway job at a time works in the same folder: another one waits in the queue, and resuming an idle job is refused with `workspace_root_busy` while the folder is taken.
+
+> **What this means:** a job in a project's own folder edits that checkout directly, with no branch of its own to review. Machines without the probe behave exactly as before. [Workspace probe settings](docs/configuration.md#workspace-probe).
+
+## Send images and files
+
+Your bot can include `attachments: [{ "name": "notes.txt", "mimeType": "text/plain", "data": "SGVsbG8K" }]` with `work_start` or `work_continue`. Send base64 bytes: files do not need to exist on either machine. Images use T3's native image input; other files use T3's attachment store outside the repository. Up to 8 files, 5 MiB each and 10 MiB total; URLs are unsupported. [Supported types, exact schema and retry behavior](docs/attachments.md).
 
 ## Keep a coordinator in the loop
 
@@ -174,6 +200,38 @@ Give me its job ID. Leave the thread and any work running in it alone.
 ```
 
 Give that request to your setup agent, then tell your bot to use the returned job ID with `work_continue`. The gateway follows the coordinator's replies and delegated work. Interrupting a standing job stops its current turn; it keeps the thread available for the next request. [Standing jobs and coordinator-only projects](docs/operations.md#standing-jobs).
+
+## Use threads opened directly in T3
+
+An operator can opt one existing connector into thread discovery and control without replacing its token:
+
+```sh
+t3-fleet-gateway clients list
+t3-fleet-gateway clients grant <clientId> --scope threads:read --scope threads:control
+t3-fleet-gateway clients scopes <clientId>
+```
+
+Choose the client by its name, sign-in origin, creation time and last use. If names overlap, trigger a known connector request and match its `mcp.tool_call` log's `clientId` or the observed success time in `clients diagnose <clientId>`. The gateway cannot identify which saved token a connector holds. Never paste that token into a diagnostic command.
+
+Ask the connector to call `fleet_projects`, then `fleet_threads { host: "host-a", projectId: "project-x" }`, then `work_adopt { host: "host-a", projectId: "project-x", threadId: "thread-x", requestId: "adopt-1" }`. The host must already have discovery enabled, and the connector still needs Read/Operate on that host. Adoption only reads T3; its returned job works with the existing work tools. Adopted jobs show an **adopted** badge, use no launch slot, and `work_cancel` interrupts their current turn. The operator can stop tracking with `jobs release <jobId>`.
+
+Remove the extra access, keeping the connector's token and ordinary gateway access:
+
+```sh
+t3-fleet-gateway clients ungrant <clientId> --scope threads:control --scope threads:read
+t3-fleet-gateway clients scopes <clientId>
+```
+
+Grant/ungrant applies on the next request without a restart, and affects only that client. Both commands require at least one `--scope`. `clients revoke <clientId>` keeps its whole-client revocation behavior and rejects `--scope` with a usage error pointing to `clients ungrant`. No existing client receives these scopes automatically. Operator-registered standing jobs retain their existing host Read/Operate access; only client-adopted jobs need the extra thread scopes. [Authorization and API limitations](docs/design.md#external-thread-discovery-and-adoption).
+
+| MCP tools | Purpose |
+| --- | --- |
+| `fleet_status`, `fleet_projects`, `fleet_models` | Host status, projects and current advertised models/options |
+| `fleet_threads` | Read-only, paginated T3 thread discovery; requires `threads:read` |
+| `fleet_t3_tools`, `fleet_t3_call` | Forward an allowlist of T3 read tools on one host (`nativeReads`, on by default), including threads the gateway did not start |
+| `work_start`, `work_adopt` | Launch a new job or import an existing thread; adoption requires both thread scopes |
+| `work_status`, `work_list`, `work_feed`, `work_messages` | Read job state, events and worker replies |
+| `work_continue`, `work_respond`, `work_settle`, `work_cancel` | Follow up, answer questions, settle or interrupt |
 
 ## Guides and reference
 
@@ -197,7 +255,7 @@ npm run dashboard:demo    # try the dashboard with made-up hosts and jobs
 npm run webhooks:smoke    # isolated HTTPS, retries and process-crash checks
 ```
 
-CI checks Node 24 and 26 on Linux, and Node 26 on macOS. The webhook smoke needs OpenSSL; see its [evidence and instructions](docs/evidence/webhooks.md). The optional [compatibility check](docs/operations.md#developer-compatibility-check) compares T3's MCP schemas and runs read-only probes; it installs no schedule.
+CI checks Node 24.22.1 and 26.12.1 on Linux, and Node 26.12.1 on macOS. The webhook smoke needs OpenSSL; see its [evidence and instructions](docs/evidence/webhooks.md). The optional [compatibility check](docs/operations.md#developer-compatibility-check) compares T3's MCP schemas and runs read-only probes; it installs no schedule.
 
 Contributing? Start with [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md).
 

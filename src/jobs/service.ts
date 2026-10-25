@@ -1,24 +1,27 @@
-import { probeWorkspace, type WorkspaceSelection } from './workspace.ts';
-import { configuredModel, runtimeModeAllowed, type GatewayConfig, type HostConfig, type ProjectConfig, type RuntimeMode } from '../config.ts';
+import { isThreadId } from '../threadId.js';
+import { configuredModel, RUNTIME_MODES, runtimeModeAllowed, type GatewayConfig, type HostConfig, type ProjectConfig } from '../config.ts';
 import { sha256Hex } from '../crypto.ts';
 import { describeError, GatewayError } from '../errors.ts';
 import type { CatalogProject, CatalogService } from '../hosts/catalog.ts';
 import { resolveProjectId } from '../hosts/projects.ts';
 import type { HostRegistry } from '../hosts/registry.ts';
 import type { Logger } from '../log.ts';
-import { permits, permittedHosts, type AccessLevel, type Scope } from '../oauth/scopes.ts';
+import { THREAD_READ_SCOPE, THREAD_CONTROL_SCOPE, permits, permittedHosts, type AccessLevel, type Scope } from '../oauth/scopes.ts';
 import { T3TransportError, type T3Client } from '../t3/client.ts';
 import { isT3NotFound, T3ToolError } from '../t3/results.ts';
 import type { ThreadItem, ThreadRead } from '../t3/schemas.ts';
+import { cleanThreadTitle } from '../hosts/threads.ts';
 import { HOUR, SECOND, type Clock } from '../time.ts';
+import { attachmentHashes, validateAttachments, type AttachmentInput } from './attachments.ts';
 import { scanActivity } from './activity.ts';
-import { EXCERPT_CHARS, holdsReadPosition, isActiveStatus, observe, threadLinkTarget, type ActivityRead } from './derive.ts';
+import { EXCERPT_CHARS, holdsReadPosition, isActiveStatus, isDelegatedWorkActive, observe, threadLinkTarget, type ActivityRead } from './derive.ts';
 import { newJobId } from './ids.ts';
 import { canonicalSelection, validateSelection, type LaunchSpec, type ModelSelection } from './launchSpec.ts';
+import { workspaceIntent, type WorkspaceSelection } from './workspace.ts';
 import { readWorkerMessages, type MessagePage, type MessageQuery } from './messages.ts';
 import { cancelRequestId } from './interrupt.ts';
 import { isTerminal, OPEN_STATES, type JobState } from './states.ts';
-import { jobNotFound, type FeedEvent, type Job, type JobEvent, type JobScope, type JobStore, type NewAdoptedJob } from './store.ts';
+import { jobNotFound, type FeedEvent, type Job, type JobEvent, type JobScope, type JobStore } from './store.ts';
 import { launchPolicy, mapProjects, parseProjectRef, projectRef } from './targets.ts';
 
 /** Bounds on agent-supplied text. T3 accepts up to 120,000 characters per message. */
@@ -50,13 +53,23 @@ export interface Caller {
   scopes: readonly Scope[];
 }
 
+/**
+ * What work_start was asked for: exactly one of `project` (a configured alias) or `target`. `target: { host }` names no
+ * project and means the host's scratch alias (`defaultProject`); `target: { host, projectId }` names a T3 project from
+ * fleet_projects on a host with discovery enabled.
+ */
 export interface StartInput {
-  workspace?: WorkspaceSelection;
   project?: string | undefined;
   target?: { host: string; projectId?: string | undefined } | undefined;
   /** An explicit provider, model and options from fleet_models; without it the configured defaults apply. */
   modelSelection?: ModelSelection | undefined;
+  /**
+   * Where a named project's work runs (workspace.ts). Only a host with a `workspaceProbeCommand` takes one; without it the
+   * job is a worktree from the local base, as before. Not for scratch work.
+   */
+  workspace?: WorkspaceSelection | undefined;
   task: string;
+  attachments?: AttachmentInput[] | undefined;
   requestId: string;
   title?: string | undefined;
 }
@@ -64,6 +77,7 @@ export interface StartInput {
 export interface ContinueInput {
   jobId: string;
   message: string;
+  attachments?: AttachmentInput[] | undefined;
   requestId: string;
 }
 
@@ -106,21 +120,6 @@ export interface AdoptInput {
   title?: string | undefined;
 }
 
-/** work_adopt: a thread on a host, taken over by the calling agent. */
-export interface AdoptThreadInput {
-  host: string;
-  threadId: string;
-  requestId: string;
-  /** Shown to agents instead of the thread's T3 title; the thread is never renamed. */
-  title?: string | undefined;
-}
-
-/** A thread read for adoption: its detail, and every field of the job that follows it except the id, label and title. */
-interface ObservedThread {
-  thread: ThreadRead['thread'];
-  job: Omit<NewAdoptedJob, 'id' | 'projectAlias' | 'title'>;
-}
-
 export interface Feed {
   events: FeedEvent[];
   nextCursor: number;
@@ -154,12 +153,34 @@ export interface QuestionRequest {
 }
 
 export interface JobDetail {
+  settled: boolean | null;
+  settledAt: string | null;
   job: Job;
   recentEvents: JobEvent[];
   /** Questions the worker waits on. `questions` is null when they could not be read from T3. */
   pendingRequests: QuestionRequest[];
   /** Blocked with no answerable question: a permission approval only the operator can give in T3. */
   waitingForApproval: boolean;
+}
+
+/** The refusal of a resume while another job holds the folder this root job works in. */
+function rootBusy(job: Job): GatewayError {
+  return new GatewayError(
+    'workspace_root_busy',
+    `Job ${job.id} works in its project's own folder, which another gateway job on host ${job.hostId} holds right now. ` +
+      'Nothing was sent. Try again when that job is finished or idle (work_list shows the jobs), or start the work in a fresh worktree.',
+  );
+}
+
+/** Client imports/resumes need positive evidence that this is a normal, unarchived conversation. */
+function requireExternalEligibility(thread: ThreadRead['thread']): void {
+  const relation = thread.relationshipToParent;
+  if (thread.archived === undefined || (relation !== null && relation !== 'fork' && relation !== 'subagent')) {
+    throw new GatewayError('t3_invalid_response', 'T3 did not report known archive and lineage metadata. Client adoption/resume is unavailable for this thread.');
+  }
+  if (thread.archived || relation === 'subagent') {
+    throw new GatewayError('job_state_conflict', 'Archived and delegated child threads cannot be adopted or resumed; use the parent thread in T3.');
+  }
 }
 
 /** A stable hash of a tool's meaningful input, for request-id idempotency. */
@@ -175,22 +196,31 @@ export function inputHash(tool: string, input: Record<string, unknown>): string 
  * changed target or selection under the same request id conflicts.
  */
 export function startInputHash(input: StartInput): string {
-  if (input.target === undefined && input.modelSelection === undefined && input.workspace === undefined) {
+  const attachments = validateAttachments(input.attachments);
+  if (input.target === undefined && input.modelSelection === undefined && input.workspace === undefined && attachments.length === 0) {
     return inputHash('work_start', { project: input.project, task: input.task, title: input.title });
   }
-  const workspace = input.workspace?.type === 'worktree' ? {
-    type: input.workspace.type,
-    ...(input.workspace.baseRef === undefined ? {} : { baseRef: input.workspace.baseRef }),
-    ...(input.workspace.startFromOrigin === undefined ? {} : { startFromOrigin: input.workspace.startFromOrigin }),
-  } : input.workspace === undefined ? undefined : { type: input.workspace.type };
+  if (input.target === undefined && input.modelSelection === undefined && input.workspace === undefined) {
+    return inputHash('work_start', { project: input.project, task: input.task, title: input.title, attachments: attachmentHashes(attachments) });
+  }
   return inputHash('work_start', {
+    ...(attachments.length ? { attachments: attachmentHashes(attachments) } : {}),
     project: input.project ?? null,
     target: input.target === undefined ? null : { host: input.target.host, ...(input.target.projectId === undefined ? {} : { projectId: input.target.projectId }) },
     modelSelection: input.modelSelection === undefined ? null : canonicalSelection(input.modelSelection),
-    ...(workspace === undefined ? {} : { workspace }),
+    // Only a request that names a workspace hashes one: a request without it keeps the hash it always had.
+    ...(input.workspace === undefined ? {} : { workspace: canonicalWorkspace(input.workspace) }),
     task: input.task,
     title: input.title,
   });
+}
+
+function canonicalWorkspace(workspace: WorkspaceSelection): Record<string, unknown> {
+  return workspace.type !== 'worktree' ? { type: workspace.type } : {
+    type: 'worktree',
+    ...(workspace.baseRef === undefined ? {} : { baseRef: workspace.baseRef }),
+    ...(workspace.startFromOrigin === undefined ? {} : { startFromOrigin: workspace.startFromOrigin }),
+  };
 }
 
 /** Why work_start is refused in a project, and where to send the work instead. */
@@ -221,11 +251,6 @@ export function threadTitle(jobId: string, task: string, title: string | undefin
 /** The marker in every job thread's title; reconciliation finds launched threads by it. */
 export function jobMarker(jobId: string): string {
   return `[job:${jobId}]`;
-}
-
-/** The job whose marker ends a thread title (after trimming); a marker anywhere else names no job. */
-export function markedJobId(title: string): string | undefined {
-  return /\[job:([^[\]]+)\]$/.exec(title.trim())?.[1];
 }
 
 /**
@@ -277,13 +302,25 @@ export class JobService {
     throw new GatewayError('not_found', `No project "${alias}". Known projects: ${known.join(', ') || '(none configured)'}. fleet_status lists them.`);
   }
 
+  /**
+   * A job as an agent may use it, checked before anything is read from T3 or returned from the ledger: a job on
+   * a host the agent may not read is reported exactly as an unknown job id; one it may read but not operate is
+   * refused with insufficient_scope. The ledger read is limited to the grant's hosts in SQL, so the stored row of a
+   * job the agent may not see is not even parsed (a launch plan it cannot read would be reported, and the report
+   * would show the job exists).
+   */
   #jobFor(caller: Caller, jobId: string, level: AccessLevel): Job {
     const requestedHosts = permittedHosts(caller.scopes, level);
     const readableHosts = permittedHosts(caller.scopes, 'read');
     const scope = requestedHosts === 'all' || readableHosts === 'all'
       ? {} : { hostIds: [...new Set([...requestedHosts, ...readableHosts])] };
     const job = this.store.get(jobId, scope);
-    if (job && permits(caller.scopes, level, job.hostId)) return job;
+    if (job && permits(caller.scopes, level, job.hostId)) {
+      if (job.origin === 'adopted') {
+        this.#requireThreadScope(caller, level);
+      }
+      return job;
+    }
     if (job && permits(caller.scopes, 'read', job.hostId)) {
       throw new GatewayError(
         'insufficient_scope',
@@ -293,16 +330,49 @@ export class JobService {
     throw jobNotFound(jobId);
   }
 
-  /** The rows of the ledger an agent may operate on: its grant's hosts, unless it covers all. */
-  #operable(caller: Caller): JobScope {
-    const hosts = permittedHosts(caller.scopes, 'operate');
-    return hosts === 'all' ? {} : { hostIds: hosts };
-  }
-
   /** The rows of the ledger an agent may read: its grant's hosts, unless it covers all. */
   #visible(caller: Caller, mine = false): JobScope {
     const hosts = permittedHosts(caller.scopes, 'read');
-    return { ...(mine ? { clientId: caller.clientId } : {}), ...(hosts === 'all' ? {} : { hostIds: hosts }) };
+    return { includeAdopted: caller.scopes.includes(THREAD_READ_SCOPE), ...(mine ? { clientId: caller.clientId } : {}), ...(hosts === 'all' ? {} : { hostIds: hosts }) };
+  }
+
+  #requireThreadScope(caller: Caller, level: AccessLevel): void {
+    if (!caller.scopes.includes(THREAD_READ_SCOPE)) throw new GatewayError('insufficient_scope', 'External threads require threads:read. Ask the operator to grant it with clients grant.');
+    if (level === 'operate' && !caller.scopes.includes(THREAD_CONTROL_SCOPE)) {
+      throw new GatewayError('insufficient_scope', 'Controlling external threads requires threads:control. Ask the operator to grant it with clients grant.');
+    }
+  }
+
+  #auditThread(caller: Caller, job: Job, action: Parameters<JobStore['auditThread']>[2]): void {
+    this.store.auditThread(job, caller.clientId, action);
+  }
+
+  /** Imported threads can be reconfigured in T3. Resuming must not bypass the current project or host ceiling. */
+  async #validateAdoptedResume(job: Job): Promise<void> {
+    if (job.origin !== 'adopted' || job.threadId === null) return;
+    const host = this.#config.hosts.find((candidate) => candidate.id === job.hostId);
+    if (!host) throw new GatewayError('not_found', 'The adopted thread host is no longer configured.');
+    // State only, messages view; no history is needed to validate the resume policy.
+    const { thread } = await this.#registry.client(job.hostId).readThread({
+      threadId: job.threadId, view: 'messages', limit: 1, runLimit: 1, maxCharsPerItem: 1,
+    });
+    requireExternalEligibility(thread);
+    if (thread.threadId !== job.threadId || thread.projectId !== job.t3ProjectId) {
+      throw new GatewayError('job_state_conflict', 'The imported thread changed project or is no longer a resumable thread. Check it in T3.');
+    }
+    const projects = (await this.#catalog.projects(job.hostId, { refresh: true })).value;
+    const mapping = mapProjects(this.#config, job.hostId, projects).get(thread.projectId);
+    if (!mapping) throw new GatewayError('not_found', 'The adopted thread project is no longer available.');
+    const policy = launchPolicy(host, mapping);
+    if (policy.kind === 'ambiguous') throw new GatewayError('job_state_conflict', 'The adopted thread project has ambiguous configured aliases.');
+    const ceiling = policy.kind === 'alias' ? policy.project.runtimeMode : host.discovery.runtimeMode;
+    const mode = RUNTIME_MODES.find((candidate) => candidate === thread.runtimeMode);
+    if (!mode || !runtimeModeAllowed(mode, host.access) || RUNTIME_MODES.indexOf(mode) > RUNTIME_MODES.indexOf(ceiling)) {
+      throw new GatewayError('job_state_conflict', 'The imported thread runtime mode is unknown or exceeds its current project/host ceiling. Nothing was sent. Review it in T3.');
+    }
+    if (isTerminal(this.store.require(job.id).state)) {
+      throw new GatewayError('job_state_conflict', 'The adopted job was released while its resume was being checked. Nothing was sent.');
+    }
   }
 
   /**
@@ -318,6 +388,18 @@ export class JobService {
     throw new GatewayError('not_found', `No host "${hostId}". fleet_status lists the hosts you can use.`);
   }
 
+  /**
+   * Start a job. A repeated request id is answered first, from the ledger and the grant alone: it returns its job (if the
+   * agent may operate on that job's host, the one it was started on, whatever the configuration says now), a reused
+   * one with different input is refused (`request_id_conflict`), and nothing is read from T3 or from the current
+   * project configuration. Then the host is authorized. A configured alias without a model selection is
+   * recorded at once and resolved at dispatch: a worktree alias with no stored plan, a scratch alias (or the host's
+   * default, for `target: { host }`) with a plan built from the configuration alone. Neither needs the host to be up,
+   * so both queue while it is down. A request with a `target.projectId` or a selection on a worktree alias is resolved
+   * now against the host's catalogs (read-only; nothing is created until that returns), and its launch spec is
+   * recorded with the job. Discovery is required only for what discovery is: an explicit `projectId` and a model
+   * selection. The host's own default scratch alias needs none.
+   */
   async start(caller: Caller, input: StartInput): Promise<{ job: Job; created: boolean }> {
     if ((input.project === undefined) === (input.target === undefined)) {
       throw new GatewayError('invalid_argument', 'Pass exactly one of project (a configured alias) or target ({ host } for no named project, or { host, projectId } from fleet_projects).');
@@ -325,8 +407,9 @@ export class JobService {
     const hash = startInputHash(input);
     const key = this.store.idempotencyKey(caller.clientId, 'work_start', input.requestId);
     // A retry returns the job of the first request, which the project config may since have moved to another host:
-    // the agent must still be allowed to operate on the job's own host.
-    const scope = this.#operable(caller);
+    // the agent must still be allowed to operate on the job's own host. The lookup is limited to those hosts in SQL.
+    const hosts = permittedHosts(caller.scopes, 'operate');
+    const scope: JobScope = hosts === 'all' ? {} : { hostIds: hosts };
     const replayed = key && this.store.get(key.jobId, scope);
     if (key && !replayed) {
       throw new GatewayError(
@@ -343,12 +426,11 @@ export class JobService {
     }
     let project = input.project === undefined ? undefined : this.#projectFor(caller, input.project, 'operate');
     const host = project ? this.#hostFor(caller, project.host, 'operate') : this.#hostFor(caller, input.target!.host, 'operate');
-    if (project && !project.allowWorkStart) throw this.#startDisabled(caller, project);
     const hostOnly = input.target !== undefined && input.target.projectId === undefined;
-    if (!host.discovery.enabled && (input.target !== undefined || input.modelSelection !== undefined)) {
+    if (!host.discovery.enabled && (input.target?.projectId !== undefined || input.modelSelection !== undefined)) {
       throw new GatewayError(
         'discovery_disabled',
-        `Host ${host.id} has discovery disabled: work_start there takes a configured project alias (fleet_status lists them) and no target or modelSelection.`,
+        `Host ${host.id} has discovery disabled: work_start there takes a configured project alias (fleet_status lists them), or target { host } for its default scratch alias, and no explicit projectId or modelSelection.`,
       );
     }
     if (hostOnly) {
@@ -360,18 +442,66 @@ export class JobService {
         throw new GatewayError('invalid_argument', `Host ${host.id} defaultProject must be a scratch alias on that host.`);
       }
     }
-    const { spec, branchPrefix } = await this.#resolveLaunch(caller, host, project, input);
+    if (input.workspace !== undefined) {
+      if (project?.workspaceMode === 'scratch') {
+        throw new GatewayError('invalid_argument', 'Scratch projects run in T3\'s own scratch workspace and take no workspace choice.');
+      }
+      if (host.workspaceProbeCommand === undefined) {
+        throw new GatewayError(
+          'invalid_argument',
+          `Host ${host.id} does not choose workspaces: its operator has not configured a workspaceProbeCommand, so work_start there takes no workspace. ` +
+            'Named projects there run in a fresh worktree from the project\'s local base branch.',
+        );
+      }
+    }
+    if (project?.workspaceMode === 'worktree' && input.target === undefined && input.modelSelection === undefined) {
+      if (!project.allowWorkStart) throw this.#startDisabled(caller, project);
+      const id = newJobId();
+      // A host without a probe keeps the plain record: no launch spec, resolved from the configuration at dispatch. A host with one
+      // records only what was asked for (nothing is read from T3 or the host now); the dispatcher resolves the folder and the workspace.
+      const aliasOnly = host.workspaceProbeCommand === undefined ? undefined : this.#aliasLaunch(project, input);
+      const result = this.store.create({
+        id,
+        clientId: caller.clientId,
+        requestId: input.requestId,
+        inputHash: hash,
+        projectAlias: project.alias,
+        hostId: project.host,
+        task: input.task,
+        attachments: validateAttachments(input.attachments),
+        title: threadTitle(id, input.task, input.title),
+        branch: aliasOnly?.workspace.type === 'root' ? '' : `${project.branchPrefix}${id}`,
+        runtimeMode: project.runtimeMode,
+        ...(aliasOnly ? { launchSpec: aliasOnly } : {}),
+      }, scope);
+      if (result.created) this.wake();
+      return result;
+    }
+    const { spec, branchPrefix } = await (async () => {
+      try {
+        const plan = project?.workspaceMode === 'scratch' && input.target?.projectId === undefined
+          ? await this.#scratchLaunch(caller, host, project, input)
+          : await this.#resolveLaunch(caller, host, project, input);
+        this.#registry.signals(host.id).record('start');
+        return plan;
+      } catch (error) {
+        this.#registry.signals(host.id).record('start', error);
+        throw error;
+      }
+    })();
     const id = newJobId();
     const result = this.store.create({
       id,
       clientId: caller.clientId,
       requestId: input.requestId,
       inputHash: hash,
-      projectAlias: spec.alias ?? projectRef(host.id, spec.projectId),
+      projectAlias: spec.alias ?? projectRef(host.id, spec.projectId!),
       hostId: host.id,
       task: input.task,
+      attachments: validateAttachments(input.attachments),
       title: threadTitle(id, input.task, input.title),
-      branch: spec.v !== 1 && spec.workspace.kind !== 'worktree' ? '' : `${branchPrefix}${id}`,
+      // A root job runs in the project's own folder, on whatever branch is checked out there: it has none of its own.
+      branch: spec.v === 2 || (spec.v === 3 && spec.workspace.type === 'root') ? '' : `${branchPrefix}${id}`,
       runtimeMode: spec.runtimeMode,
       t3ProjectId: spec.projectId,
       launchSpec: spec,
@@ -380,9 +510,67 @@ export class JobService {
     return result;
   }
 
+  /**
+   * The record of an alias-only request on a host that chooses workspaces: the intent, with the alias's configured
+   * policy (runtime mode, model, base ref) as it is now. Nothing about the project is read from T3 or the host.
+   */
+  #aliasLaunch(project: ProjectConfig, input: StartInput): Extract<LaunchSpec, { v: 3 }> {
+    const configured = configuredModel(this.#config, project);
+    return {
+      v: 3,
+      projectId: null,
+      projectName: null,
+      source: 'alias',
+      alias: project.alias,
+      runtimeMode: project.runtimeMode,
+      model: configured ? { source: configured.source, selection: configured.selection } : { source: 't3_default', selection: null },
+      hostId: project.host,
+      workspace: workspaceIntent(input.workspace, project.baseRef),
+    };
+  }
+
   #startDisabled(caller: Caller, project: ProjectConfig): GatewayError {
-    const standing = this.store.standingJobs(project.alias).filter((job) => permits(caller.scopes, 'read', job.hostId));
+    const standing = this.store.standingJobs(project.alias).filter((job) =>
+      permits(caller.scopes, 'read', job.hostId) && (job.origin !== 'adopted' || caller.scopes.includes(THREAD_READ_SCOPE)));
     return new GatewayError('start_disabled', startDisabledMessage(project.alias, standing));
+  }
+
+  /**
+   * The launch plan of a scratch alias, built from the configuration alone: its pin, runtime mode and model come from the
+   * config, and nothing about the project is read from T3 (the dispatcher checks the pin against the host's projects right
+   * before the launch). A host that is down therefore still takes the job, and no T3 project name is ever recorded.
+   * An explicit model selection is the exception: it is validated against the host's fresh catalog now and again at dispatch.
+   */
+  async #scratchLaunch(
+    caller: Caller,
+    host: HostConfig,
+    project: ProjectConfig,
+    input: StartInput,
+  ): Promise<{ spec: LaunchSpec; branchPrefix: string }> {
+    if (!project.allowWorkStart) throw this.#startDisabled(caller, project);
+    let model: LaunchSpec['model'];
+    if (input.modelSelection) {
+      const providers = (await this.#catalog.models(host.id, { refresh: true })).value;
+      model = { source: 'explicit', selection: { ...validateSelection(host.id, providers, input.modelSelection) } };
+    } else {
+      const configured = configuredModel(this.#config, project);
+      model = configured ? { source: configured.source, selection: configured.selection } : { source: 't3_default', selection: null };
+    }
+    return {
+      spec: {
+        v: 2,
+        projectId: project.t3ProjectId!,
+        projectName: null,
+        source: 'alias',
+        alias: project.alias,
+        runtimeMode: project.runtimeMode,
+        model,
+        hostId: host.id,
+        workspace: { kind: 'scratch' },
+        defaultProject: input.target !== undefined && input.target.projectId === undefined ? project.alias : null,
+      },
+      branchPrefix: project.branchPrefix,
+    };
   }
 
   /**
@@ -469,41 +657,37 @@ export class JobService {
       );
     }
     const scratch = alias === null ? undefined : this.#config.projects.find((candidate) => candidate.alias === alias && candidate.workspaceMode === 'scratch');
+    if (scratch && input.workspace !== undefined) {
+      throw new GatewayError('invalid_argument', 'Scratch projects run in T3\'s own scratch workspace and take no workspace choice.');
+    }
     const common = {
       projectId: found.id,
-      projectName: found.name,
       source: alias === null ? 'discovered' : 'alias',
       alias,
       runtimeMode: policy.runtimeMode,
       model,
-    } satisfies Pick<LaunchSpec, 'projectId' | 'projectName' | 'source' | 'alias' | 'runtimeMode' | 'model'>;
-    if (scratch && input.workspace !== undefined) throw new GatewayError('invalid_argument', 'Scratch projects do not accept a workspace override.');
-    const selection = input.workspace ?? { type: 'auto' };
-    if (scratch) {
-      return {
-        spec: {
-          v: 2,
-          ...common,
-          hostId: host.id,
-          workspace: { kind: 'scratch' },
-          defaultProject: input.target !== undefined && input.target.projectId === undefined ? scratch.alias : null,
-        },
-        branchPrefix: policy.branchPrefix,
-      };
-    }
-    const inspection = await probeWorkspace(host, this.#registry, found.id, selection);
+    } satisfies Pick<LaunchSpec, 'projectId' | 'source' | 'alias' | 'runtimeMode' | 'model'>;
     return {
-      spec: {
+      // A pinned scratch project reached by its id is a scratch launch like the alias itself: no name recorded, no branch.
+      spec: scratch ? {
+        v: 2,
+        ...common,
+        projectName: null,
+        hostId: host.id,
+        workspace: { kind: 'scratch' },
+        defaultProject: null,
+      } : host.workspaceProbeCommand !== undefined ? {
+        // The host chooses workspaces: the folder and the workspace are decided at dispatch; only the intent is recorded.
         v: 3,
         ...common,
+        projectName: found.name,
         hostId: host.id,
-        selection,
-        inspection,
-        workspace: selection.type === 'root' || inspection.kind === 'root' ? { kind: 'root' } : {
-          kind: 'worktree',
-          baseRef: selection.type === 'worktree' ? selection.baseRef ?? 'main' : 'main',
-          startFromOrigin: selection.type === 'worktree' ? selection.startFromOrigin ?? true : true,
-        },
+        workspace: workspaceIntent(input.workspace, policy.baseRef),
+      } : {
+        v: 1,
+        ...common,
+        projectName: found.name,
+        baseRef: policy.baseRef,
       },
       branchPrefix: policy.branchPrefix,
     };
@@ -542,6 +726,16 @@ export class JobService {
     if (pendingRequestId !== undefined && !job.pendingRequestIds.includes(pendingRequestId)) {
       throw new GatewayError('not_found', 'That request is not pending on this job. Read work_status without pendingRequestId for the current list.');
     }
+    // State only, messages view: settlement belongs to T3 and is never inferred from the ledger.
+    let settlement: { settled: boolean | null; settledAt: string | null } = { settled: null, settledAt: null };
+    if (job.threadId !== null) {
+      try {
+        const read = await this.#registry.client(job.hostId).readThread({
+          threadId: job.threadId, view: 'messages', limit: 1, runLimit: 1, maxCharsPerItem: 1,
+        });
+        settlement = { settled: read.thread.settled ?? null, settledAt: read.thread.settledAt ?? null };
+      } catch { /* A host that cannot answer leaves settlement unknown; ledger status remains available. */ }
+    }
     const pendingRequests = await Promise.all(
       job.pendingRequestIds.map(async (requestId, index): Promise<QuestionRequest> => {
         if (pendingRequestId !== undefined ? requestId !== pendingRequestId : index >= MAX_QUESTION_READS) {
@@ -553,6 +747,7 @@ export class JobService {
     );
     return {
       job,
+      ...settlement,
       recentEvents: this.store.recentEvents(jobId, 10),
       pendingRequests,
       waitingForApproval: job.state === 'needs_input' && job.pendingRequestIds.length === 0,
@@ -593,98 +788,53 @@ export class JobService {
 
   /**
    * Adopt an existing T3 thread as a standing job (operator CLI only). The thread must belong to the
-   * project's T3 project. Adopting a thread that is already a standing job of the project returns that job
+   * project's T3 project. Its state comes from a read now, and both read positions (messages and
+   * activity view) start at the thread's current end, so the watcher follows only what happens from now
+   * on; delegated work still running is found by a bounded scan back through the activity view
+   * (scanActivity). Adopting a thread that is already a standing job of the project returns that job
    * (`created: false`).
    */
   async adopt(input: AdoptInput): Promise<{ job: Job; created: boolean }> {
+    if (!isThreadId(input.threadId)) throw new GatewayError('invalid_argument', 'Invalid T3 thread id.');
     const project = this.project(input.project);
-    const existing = this.store.openJobForThread(input.threadId);
+    const existing = this.store.openJobForThread(input.threadId, project.host);
     if (existing?.standing && existing.projectAlias === project.alias) return { job: existing, created: false };
-    const projectId = await resolveProjectId(this.#registry, project);
-    const { thread, job } = await this.#observeThread(project.host, input.threadId, true);
+    return this.#adoptThread(project, await resolveProjectId(this.#registry, project), input);
+  }
+
+  async #adoptThread(project: { alias: string; host: string }, projectId: string, input: AdoptInput,
+    adoption?: { clientId: string; requestId: string; inputHash: string }): Promise<{ job: Job; created: boolean }> {
+    const client = this.#registry.client(project.host);
+    let read: ThreadRead;
+    let questions: string[];
+    let activity: ActivityRead;
+    try {
+      read = await readToEnd(client, input.threadId);
+      questions = await client.listPendingRequests(input.threadId);
+      activity = await scanActivity(client, input.threadId, read.items.at(-1)?.position ?? read.nextPosition);
+    } catch (error) {
+      if (error instanceof T3ToolError && isT3NotFound(error)) {
+        throw new GatewayError('not_found', `Host ${project.host} has no T3 thread ${input.threadId} (${error.t3Code}).`);
+      }
+      throw error;
+    }
+    const { thread } = read;
+    if (adoption && (thread.threadId !== input.threadId || thread.projectId !== projectId)) {
+      throw new GatewayError('not_found', 'No thread in that project.');
+    }
+    if (adoption) requireExternalEligibility(thread);
     if (thread.projectId !== projectId) {
       throw new GatewayError(
         'invalid_argument',
         `Thread ${input.threadId} belongs to T3 project ${thread.projectId}, not to project "${project.alias}" (T3 project ${projectId}).`,
       );
     }
-    return this.store.adopt({ ...job, id: newJobId(), projectAlias: project.alias, title: input.title ?? thread.title });
-  }
-
-  /**
-   * work_adopt: take over an existing T3 thread as an ordinary job of the calling agent (docs/design.md, "Taking over a
-   * thread"). Authorization and the host's nativeReads come before the ledger and T3. A repeated request id, or a
-   * thread an open job already follows, returns that job without asking T3; so does a thread whose title carries the
-   * marker of an open job that has no thread yet, once the thread is read. Nothing is launched, renamed or
-   * reconfigured; the job starts in the thread's observed state and holds a slot while running, even past the limit.
-   */
-  async adoptThread(caller: Caller, input: AdoptThreadInput): Promise<{ job: Job; created: boolean }> {
-    const host = this.#hostFor(caller, input.host, 'operate');
-    if (!host.nativeReads) {
-      throw new GatewayError(
-        'native_reads_disabled',
-        `Host ${host.id} does not allow native reads (the operator set nativeReads false), so its threads cannot be taken over.`,
-      );
+    // A launch with a lost response may not have bound its thread id yet. Its gateway marker still owns the thread.
+    if (adoption) {
+      const marker = /\[job:([a-z0-9]{10})\]/.exec(thread.title)?.[1];
+      const owner = marker && this.store.get(marker, { hostIds: [project.host] });
+      if (owner && owner.origin === 'gateway') throw new GatewayError('job_state_conflict', 'This thread belongs to a gateway launch. Use its existing job.');
     }
-    const request = {
-      clientId: caller.clientId,
-      requestId: input.requestId,
-      inputHash: inputHash('work_adopt', { host: input.host, threadId: input.threadId, title: input.title }),
-    };
-    const scope = this.#operable(caller);
-    const before = this.store.adoptedBefore(host.id, input.threadId, request, scope);
-    if (before) return before;
-    const { thread, job } = await this.#observeThread(host.id, input.threadId, false);
-    // A launch T3 has not confirmed yet (dispatching or unknown) has no thread id in the ledger, only its marker in the title.
-    const marked = markedJobId(thread.title);
-    const launching = this.store.adoptedBefore(host.id, input.threadId, request, scope, marked);
-    if (launching) return launching;
-    if (thread.archived === true) {
-      throw new GatewayError(
-        'invalid_argument',
-        `Thread ${thread.threadId} on host ${host.id} is archived, and T3 sends nothing to archived threads: unarchive it in T3 first.`,
-      );
-    }
-    if (!runtimeModeAllowed(job.runtimeMode as RuntimeMode, host.access)) {
-      throw new GatewayError(
-        'invalid_argument',
-        `Thread ${thread.threadId} runs in runtime mode ${JSON.stringify(job.runtimeMode)}, above the gateway's access "${host.access}" ` +
-          `on host ${host.id}: T3 would refuse every message the gateway sends it. Lower the thread's mode in T3, or ask the operator ` +
-          "to raise the host's access.",
-      );
-    }
-    // A label only: the configured alias exactly one alias maps to, else the internal ref. Nothing is launched, so no launch policy applies.
-    const mapping = mapProjects(this.#config, host.id, (await this.#catalog.projects(host.id)).value).get(thread.projectId);
-    const alias = mapping?.aliases.length === 1 && mapping.ambiguousAliases.length === 0
-      ? mapping.aliases[0]!.alias
-      : projectRef(host.id, thread.projectId);
-    const result = this.store.adoptForAgent({ ...job, id: newJobId(), projectAlias: alias, title: input.title ?? thread.title }, request, scope, marked);
-    if (result.created) this.wake();
-    return result;
-  }
-
-  /**
-   * Read a thread being adopted. Its state comes from a read now, and both read positions (messages and activity view)
-   * start at the thread's current end, so the watcher follows only what happens from now on; delegated work still
-   * running is found by a bounded scan back through the activity view (scanActivity). A thread T3 does not know is
-   * `not_found`.
-   */
-  async #observeThread(hostId: string, threadId: string, standing: boolean): Promise<ObservedThread> {
-    const client = this.#registry.client(hostId);
-    let read: ThreadRead;
-    let questions: string[];
-    let activity: ActivityRead;
-    try {
-      read = await readToEnd(client, threadId);
-      questions = await client.listPendingRequests(threadId);
-      activity = await scanActivity(client, threadId, read.items.at(-1)?.position ?? read.nextPosition);
-    } catch (error) {
-      if (error instanceof T3ToolError && isT3NotFound(error)) {
-        throw new GatewayError('not_found', `Host ${hostId} has no T3 thread ${threadId} (${error.t3Code}).`);
-      }
-      throw error;
-    }
-    const { thread } = read;
     const lastRunId = thread.activeRunId ?? thread.latestRunId;
     const seen = observe(
       {
@@ -694,7 +844,7 @@ export class JobService {
         activityPosition: null,
         threadLink: null,
         latestActivityAt: null,
-        standing,
+        standing: true,
         delegatedWork: [],
         delegatedUntracked: 0,
         delegatedUntrackedRunId: null,
@@ -704,31 +854,68 @@ export class JobService {
       activity,
     );
     const runtimeMode = (thread as { runtimeMode?: unknown }).runtimeMode;
-    return {
-      thread,
-      job: {
-        hostId,
-        t3ProjectId: thread.projectId,
-        state: seen.state,
-        branch: thread.branch ?? '',
-        runtimeMode: typeof runtimeMode === 'string' ? runtimeMode : '',
-        threadId: thread.threadId,
-        threadTitle: thread.title,
-        threadLink: threadLinkTarget(thread.link),
-        lastRunId: seen.lastRunId,
-        pendingRequestIds: seen.pendingRequestIds,
-        latestMessageExcerpt: seen.excerpt ?? null,
-        latestMessageTruncated: seen.excerptTruncated ?? false,
-        latestActivityAt: seen.activityAt,
-        readPosition: seen.readPosition,
-        activityPosition: seen.activityPosition,
-        lastErrorCode: seen.errorCode ?? null,
-        lastErrorMessage: seen.errorCode ? 'The latest T3 run failed. Open the thread in T3 for details.' : null,
-        delegatedWork: seen.delegatedWork,
-        delegatedUntracked: seen.delegatedUntracked,
-        delegatedUntrackedRunId: seen.delegatedUntrackedRunId,
-      },
-    };
+    return this.store.adopt({
+      id: newJobId(),
+      projectAlias: project.alias,
+      hostId: project.host,
+      t3ProjectId: projectId,
+      state: seen.state,
+      title: cleanThreadTitle(input.title ?? thread.title),
+      branch: thread.branch ?? '',
+      runtimeMode: typeof runtimeMode === 'string' ? runtimeMode : '',
+      threadId: thread.threadId,
+      threadTitle: cleanThreadTitle(thread.title),
+      threadLink: threadLinkTarget(thread.link),
+      lastRunId: seen.lastRunId,
+      pendingRequestIds: seen.pendingRequestIds,
+      latestMessageExcerpt: seen.excerpt ?? null,
+      latestMessageTruncated: seen.excerptTruncated ?? false,
+      latestActivityAt: seen.activityAt,
+      readPosition: seen.readPosition,
+      activityPosition: seen.activityPosition,
+      lastErrorCode: seen.errorCode ?? null,
+      lastErrorMessage: seen.errorCode ? 'The latest T3 run failed. Open the thread in T3 for details.' : null,
+      delegatedWork: seen.delegatedWork,
+      delegatedUntracked: seen.delegatedUntracked,
+      delegatedUntrackedRunId: seen.delegatedUntrackedRunId,
+    }, adoption);
+  }
+
+  /** Client adoption never launches, sends, configures or organizes the T3 thread. */
+  async adoptExternal(caller: Caller, input: { host: string; projectId: string; threadId: string; requestId: string }): Promise<{ job: Job; created: boolean }> {
+    this.#requireThreadScope(caller, 'operate');
+    const host = this.#hostFor(caller, input.host, 'operate');
+    if (!isThreadId(input.threadId)) throw new GatewayError('invalid_argument', 'Invalid T3 thread id.');
+    const hash = inputHash('work_adopt', { host: input.host, projectId: input.projectId, threadId: input.threadId });
+    const key = this.store.idempotencyKey(caller.clientId, 'work_adopt', input.requestId);
+    if (key) {
+      const job = this.#jobFor(caller, key.jobId, 'operate');
+      if (key.inputHash !== hash) throw new GatewayError('request_id_conflict', 'This requestId was used for a different adoption.');
+      this.#auditThread(caller, job, 'adopt_replayed');
+      return { job, created: false };
+    }
+    if (!host.discovery.enabled) throw new GatewayError('discovery_disabled', 'Thread adoption needs discovery.enabled on this host.');
+    const existing = this.store.jobForThread(host.id, input.threadId);
+    if (existing && (existing.origin !== 'adopted' || existing.t3ProjectId !== input.projectId)) {
+      throw new GatewayError('job_state_conflict', 'This thread already has a gateway or operator-owned job. Use that job with the appropriate scopes.');
+    }
+    if (existing) {
+      const replay = this.store.adopt({ ...existing, threadId: input.threadId, threadTitle: existing.threadTitle ?? existing.title, t3ProjectId: input.projectId },
+        { clientId: caller.clientId, requestId: input.requestId, inputHash: hash });
+      this.#auditThread(caller, replay.job, 'adopt_replayed');
+      return replay;
+    }
+    const projects = (await this.#catalog.projects(host.id, { refresh: true })).value;
+    if (!projects.some((project) => project.id === input.projectId)) throw new GatewayError('not_found', 'No project with that id on this host.');
+    const mapping = mapProjects(this.#config, host.id, projects).get(input.projectId)!;
+    const policy = launchPolicy(host, mapping);
+    if (policy.kind === 'ambiguous') throw new GatewayError('invalid_argument', 'This project has ambiguous configured aliases. Ask the operator to resolve them.');
+    const project = { alias: policy.kind === 'alias' ? policy.project.alias : projectRef(host.id, input.projectId), host: host.id };
+    const result = await this.#adoptThread(project, input.projectId, { project: project.alias, threadId: input.threadId },
+      { clientId: caller.clientId, requestId: input.requestId, inputHash: hash });
+    if (!result.created) this.#auditThread(caller, result.job, 'adopt_replayed');
+    this.wake();
+    return result;
   }
 
   /**
@@ -743,26 +930,129 @@ export class JobService {
         `Job ${job.id} was started by an agent, not adopted; only standing jobs are released. Stop it with work_cancel instead.`,
       );
     }
+    this.store.auditThread(job, 'operator', 'release');
     const released = this.store.transition(job.id, { from: OPEN_STATES, to: 'released', detail: { reason: 'released' } });
     return released ? { job: released, released: true } : { job: this.store.require(job.id), released: false };
+  }
+
+  /** Settle only a quiet finished thread. T3 remains the final authority at the mutation boundary. */
+  async settle(caller: Caller, input: { jobId: string; requestId: string }): Promise<{
+    job: Job; settled: boolean; settledAt: string | null; replayed: boolean;
+  }> {
+    const job = this.#jobFor(caller, input.jobId, 'operate');
+    this.#auditThread(caller, job, 'settle');
+    const hash = inputHash('work_settle', { jobId: input.jobId });
+    const key = this.store.idempotencyKey(caller.clientId, 'work_settle', input.requestId);
+    if (key && (key.jobId !== job.id || key.inputHash !== hash)) {
+      throw new GatewayError('request_id_conflict', 'This requestId was used for a different work_settle request. Use a new requestId.');
+    }
+    if (key?.response) {
+      const stored = JSON.parse(key.response) as { settled: boolean; settledAt: string | null };
+      return { job, ...stored, replayed: true };
+    }
+    if (job.threadId === null || !['idle', 'cancelled', 'failed', 'released'].includes(job.state)) {
+      throw new GatewayError('job_state_conflict', 'work_settle needs an idle, cancelled, failed or released job with a T3 thread.');
+    }
+    const client = this.#registry.client(job.hostId);
+    // Messages view for thread/run state; delegated work is checked separately in the activity view below.
+    const readState = () => client.readThread({ threadId: job.threadId!, view: 'messages', limit: 1, runLimit: 1, maxCharsPerItem: 1 });
+    const before = await readState();
+    if (key) {
+      // There is no T3 request key for organize. A crash/lost reply must never settle a resumed thread again.
+      if (before.thread.settled !== true) {
+        throw new GatewayError('t3_response_lost', 'The earlier settlement outcome is unknown. Nothing was sent again. Check work_status; use a new requestId only for a new settlement.');
+      }
+    } else {
+      if (before.thread.settled === undefined) {
+        throw new GatewayError('t3_invalid_response', 'This T3 host does not report settlement state; work_settle cannot confirm its result.');
+      }
+      if (before.thread.archived || before.thread.activeRunId !== null || isActiveStatus(before.thread.status) ||
+          before.recentRuns.some((run) => isActiveStatus(run.status))) {
+        throw new GatewayError('job_state_conflict', 'The T3 thread is busy or archived. Finish or cancel its turn and queued messages before settling.');
+      }
+      // Fresh, complete, bounded activity scan, including terminal/released jobs the watcher no longer follows.
+      // A partial scan cannot prove absence of delegated work, so fail closed at 2,000 items.
+      let afterPosition: number | null = null;
+      for (let page = 0; ; page++) {
+        const read = await client.readThread({
+          threadId: job.threadId, view: 'activity', afterPosition, limit: 100, runLimit: 1, maxCharsPerItem: 1,
+        });
+        if (read.items.some(isDelegatedWorkActive)) {
+          throw new GatewayError('job_state_conflict', 'The thread is waiting on delegated work. Wait for it to end before settling.');
+        }
+        if (!read.hasMore) break;
+        if (page >= 19 || read.nextPosition === null || read.nextPosition === afterPosition) {
+          throw new GatewayError('job_state_conflict', 'Delegated work could not be checked completely within the settlement scan limit. Settle this thread in T3.');
+        }
+        afterPosition = read.nextPosition;
+      }
+      if (!this.store.claimSettlement(caller.clientId, input.requestId, { inputHash: hash, jobId: job.id })) {
+        return this.settle(caller, input);
+      }
+      try {
+        await client.settleThread(job.threadId);
+      } catch (error) {
+        const permissionDenied = error instanceof T3ToolError &&
+          ['capability_denied', 'runtime_mode_escalation_denied', 'interaction_mode_escalation_denied'].includes(error.t3Code);
+        const stateRefused = error instanceof T3ToolError && error.t3Code === 'orchestration_error' &&
+          /is still running|has a queued message|is waiting on an approval or question|is archived/.test(error.message);
+        if (permissionDenied || stateRefused || (error instanceof T3TransportError && error.delivery === 'not_delivered')) {
+          this.store.releaseIdempotencyKey(caller.clientId, 'work_settle', input.requestId);
+        }
+        if (permissionDenied) {
+          throw new GatewayError('t3_unauthorized', 'The existing host credential does not permit settling this thread. Ask the operator to review its T3 access.');
+        }
+        if (stateRefused) {
+          throw new GatewayError('job_state_conflict', 'T3 refused settlement: the thread is busy, has queued messages or pending approvals, or is archived. Check it in T3 before retrying.');
+        }
+        if (!(error instanceof T3ToolError) && !(error instanceof T3TransportError && error.delivery === 'unknown')) throw error;
+        // An ambiguous write is read back once, never sent again.
+      }
+    }
+    const after = await readState();
+    if (after.thread.settled !== true) {
+      throw new GatewayError('t3_response_lost', 'T3 has not confirmed settlement. Nothing will be sent again for this requestId. Check work_status.');
+    }
+    const result = { settled: true, settledAt: after.thread.settledAt ?? null };
+    this.store.recordSettlement(job.id, caller.clientId, input.requestId, result);
+    return { job: this.store.require(job.id), ...result, replayed: key !== undefined };
   }
 
   /**
    * Send a follow-up instruction to the job's thread. Idempotent on requestId: a delivered request is
    * not sent again, and a request whose first attempt had an unknown outcome is re-sent with the same
-   * T3 clientRequestId, which T3 deduplicates.
+   * T3 clientRequestId, which T3 deduplicates. Attachment sends instead keep a durable uncertainty marker and never resend.
    */
+  readonly #attachmentContinues = new Set<string>();
+
   async continue(caller: Caller, input: ContinueInput): Promise<ContinueResult> {
+    if (!input.attachments?.length) return this.#continue(caller, input);
+    // Authorize and audit every invocation, including one refused by the in-flight guard.
+    const job = this.#jobFor(caller, input.jobId, 'operate');
+    this.#auditThread(caller, job, 'continue');
+    const lock = JSON.stringify([caller.clientId, input.requestId]);
+    if (this.#attachmentContinues.has(lock)) throw new GatewayError('job_state_conflict', 'This attachment follow-up is in progress. Retry the same requestId later.');
+    this.#attachmentContinues.add(lock);
+    try { return await this.#continue(caller, input, true); }
+    finally { this.#attachmentContinues.delete(lock); }
+  }
+
+  async #continue(caller: Caller, input: ContinueInput, audited = false): Promise<ContinueResult> {
     // Before the request id is looked up, so a replay never returns a stored result for a job the agent may not operate.
     let job = this.#jobFor(caller, input.jobId, 'operate');
-    const hash = inputHash('work_continue', { jobId: input.jobId, message: input.message });
+    if (!audited) this.#auditThread(caller, job, 'continue');
+    const attachments = validateAttachments(input.attachments);
+    const hash = inputHash('work_continue', { jobId: input.jobId, message: input.message,
+      ...(attachments.length ? { attachments: attachmentHashes(attachments) } : {}),
+    });
     const key = this.store.idempotencyKey(caller.clientId, 'work_continue', input.requestId);
     if (key) {
       if (key.jobId !== input.jobId || key.inputHash !== hash) {
         throw new GatewayError('request_id_conflict', `requestId "${input.requestId}" was already used for a different request. Use a new requestId.`);
       }
       if (key.response !== null) {
-        const stored = JSON.parse(key.response) as { delivery?: string };
+        const stored = JSON.parse(key.response) as { delivery?: string; attachmentOutcome?: string };
+        if (stored.attachmentOutcome === 'unknown') throw attachmentOutcomeUnknown();
         return { job, delivery: stored.delivery ?? 'unknown', replayed: true };
       }
     } else {
@@ -773,17 +1063,52 @@ export class JobService {
     }
     const threadId = job.threadId;
     if (threadId === null) throw new GatewayError('job_state_conflict', `Job ${job.id} has no thread.`);
+    try {
+      await this.#validateAdoptedResume(job);
+    } catch (error) {
+      if (!key) this.store.releaseIdempotencyKey(caller.clientId, 'work_continue', input.requestId);
+      throw error;
+    }
+    // Resuming an idle job that works in the project's own folder takes the folder back first, before anything is sent: while
+    // another job holds it the follow-up waits, and the same requestId may be sent again later.
+    let attempt = job.state === 'idle' ? this.store.reserveRoot(job.id, `continue:${caller.clientId}:${input.requestId}`) : ({ kind: 'not_needed' } as const);
+    if (attempt.kind === 'busy') {
+      if (!key) this.store.releaseIdempotencyKey(caller.clientId, 'work_continue', input.requestId);
+      throw rootBusy(job);
+    }
     let sent;
     try {
-      sent = await this.#registry.client(job.hostId).sendToThread({
+      const client = this.#registry.client(job.hostId);
+      if (attachments.length) {
+        const uploaded = await client.uploadAttachments(attachments);
+        await this.#validateAdoptedResume(this.store.require(job.id));
+        const current = this.store.require(job.id);
+        if (!['idle', 'running', 'needs_input'].includes(current.state)) {
+          throw new GatewayError('job_state_conflict', `Job ${job.id} is ${current.state}; the attachment follow-up was not sent.`);
+        }
+        if (current.workspaceKind === 'root' && current.state === 'idle' &&
+            (attempt.kind !== 'held' || !current.workspaceResumeTokens.includes(attempt.token) || current.workspaceRootHeldAt === null)) {
+          attempt = this.store.reserveRoot(job.id, `continue:${caller.clientId}:${input.requestId}`);
+          if (attempt.kind === 'busy') throw rootBusy(current);
+        }
+        // CAS is durable across processes. After this boundary, never resend without a downstream retry key.
+        if (!this.store.beginAttachmentSend(caller.clientId, input.requestId)) throw attachmentOutcomeUnknown();
+        const result = await client.sendAttachments(threadId, input.message, uploaded);
+        sent = { ...result, delivery: 'accepted' };
+      } else sent = await client.sendToThread({
         threadId,
         message: input.message,
         mode: 'auto',
         clientRequestId: `t3fg-${job.id}-${sha256Hex(`${caller.clientId}\n${input.requestId}`).slice(0, 24)}`,
       });
     } catch (error) {
-      if (error instanceof T3ToolError || (error instanceof T3TransportError && error.delivery === 'not_delivered')) {
+      if (attachments.length && this.store.idempotencyKey(caller.clientId, 'work_continue', input.requestId)?.response !== null) {
+        throw attachmentOutcomeUnknown();
+      }
+      if (attachments.length || error instanceof T3ToolError || (error instanceof T3TransportError && error.delivery === 'not_delivered')) {
         this.store.releaseIdempotencyKey(caller.clientId, 'work_continue', input.requestId);
+        // Only this attempt's own claim ends here: an earlier attempt of the job that may have been delivered keeps the folder.
+        if (attempt.kind === 'held') this.store.abandonResume(job.id, attempt.token);
         throw error;
       }
       const described = describeError(error);
@@ -792,7 +1117,7 @@ export class JobService {
         `${described.message}. The message may or may not have reached T3: call work_continue again with the same requestId; T3 deduplicates it.`,
       );
     }
-    this.store.recordSend(job.id, sent, caller.clientId, input.requestId);
+    this.store.recordSend(job.id, sent, caller.clientId, input.requestId, attempt.kind === 'held' ? attempt.token : undefined);
     this.wake();
     return { job: this.store.require(job.id), delivery: sent.delivery, replayed: false };
   }
@@ -800,9 +1125,11 @@ export class JobService {
   /** Answer one of the job's pending questions. Only requests T3 lists for the job's own thread are accepted. */
   async respond(caller: Caller, input: RespondInput): Promise<Job> {
     const job = this.#jobFor(caller, input.jobId, 'operate');
+    this.#auditThread(caller, job, 'respond');
     if (job.threadId === null || isTerminal(job.state)) {
       throw new GatewayError('job_state_conflict', `Job ${job.id} is ${job.state}; it has no question to answer.`);
     }
+    await this.#validateAdoptedResume(job);
     const client = this.#registry.client(job.hostId);
     const pending = await client.listPendingRequests(job.threadId);
     if (!pending.includes(input.requestId)) {
@@ -814,13 +1141,32 @@ export class JobService {
             : 'The job has no pending questions.';
       throw new GatewayError('not_found', `That request is not pending on job ${job.id}. ${hint}`);
     }
-    await client.respondToPendingRequest(job.threadId, input.requestId, input.answers);
+    if (job.origin === 'adopted' && isTerminal(this.store.require(job.id).state)) {
+      throw new GatewayError('job_state_conflict', 'The adopted job was released while its question was being checked. Nothing was sent.');
+    }
+    // An answer starts the worker again: an idle root job takes its folder back first (see continue).
+    const attempt = job.state === 'idle' ? this.store.reserveRoot(job.id, `respond:${input.requestId}`) : ({ kind: 'not_needed' } as const);
+    if (attempt.kind === 'busy') throw rootBusy(job);
+    try {
+      await client.respondToPendingRequest(job.threadId, input.requestId, input.answers);
+    } catch (error) {
+      if (attempt.kind === 'held' && (error instanceof T3ToolError || (error instanceof T3TransportError && error.delivery === 'not_delivered'))) {
+        this.store.abandonResume(job.id, attempt.token);
+      }
+      throw error;
+    }
     const remaining = pending.filter((id) => id !== input.requestId);
     this.store.appendEvent(job.id, 'input_answered', job.state, { requestId: input.requestId });
     const moved =
       remaining.length === 0 &&
-      this.store.transition(job.id, { from: ['needs_input'], to: 'running', changes: { pendingRequestIds: remaining }, detail: { reason: 'input_answered' } });
-    if (!moved) this.store.update(job.id, { pendingRequestIds: remaining });
+      this.store.transition(job.id, { from: attempt.kind === 'held' ? ['needs_input', 'idle'] : ['needs_input'], to: 'running', changes: { pendingRequestIds: remaining }, detail: { reason: 'input_answered' } });
+    if (!moved) {
+      const waiting = attempt.kind === 'held' && remaining.length > 0 && this.store.transition(job.id, {
+        from: ['idle'], to: 'needs_input', changes: { pendingRequestIds: remaining }, detail: { reason: 'question' },
+      });
+      if (!waiting) this.store.update(job.id, { pendingRequestIds: remaining });
+    }
+    if (attempt.kind === 'held') this.store.settleResume(job.id, attempt.token);
     this.wake();
     return this.store.require(job.id);
   }
@@ -834,6 +1180,7 @@ export class JobService {
    */
   async cancel(caller: Caller, input: { jobId: string }): Promise<CancelResult> {
     const job = this.#jobFor(caller, input.jobId, 'operate');
+    this.#auditThread(caller, job, 'interrupt');
     if (job.standing) return this.#interruptStanding(job);
     if (job.state === 'queued') {
       const cancelled = this.store.transition(job.id, { from: ['queued'], to: 'cancelled', detail: { reason: 'cancelled_before_launch' } });
@@ -949,4 +1296,8 @@ async function readToEnd(client: T3Client, threadId: string): Promise<ThreadRead
   }
   if (!read) throw new GatewayError('internal_error', 'No thread read');
   return { ...read, items: kept, nextPosition: read.nextPosition ?? afterPosition };
+}
+
+function attachmentOutcomeUnknown(): GatewayError {
+  return new GatewayError('t3_response_lost', 'An attachment follow-up may have reached T3. It will not be resent: T3 has no attachment retry key. Read work_messages or inspect the thread before sending new work with a new requestId.');
 }

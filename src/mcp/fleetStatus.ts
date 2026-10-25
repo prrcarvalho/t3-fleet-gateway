@@ -5,7 +5,7 @@ import type { HostRegistry } from '../hosts/registry.ts';
 import { jobCountsByHost } from '../jobs/counts.ts';
 import type { JobService } from '../jobs/service.ts';
 import { JOB_STATES } from '../jobs/states.ts';
-import { permits, READ_SCOPE } from '../oauth/scopes.ts';
+import { permits, READ_SCOPE, THREAD_READ_SCOPE } from '../oauth/scopes.ts';
 import { isoTime } from '../time.ts';
 import { GATEWAY_NAME, GATEWAY_VERSION } from '../version.ts';
 import { defineTool } from './tools.ts';
@@ -16,6 +16,7 @@ const hostSchema = z.object({
   id: z.string(),
   label: z.string().nullable(),
   defaultProject: z.string().nullable().describe('Configured scratch alias for work_start { target: { host } }; null when no machine default is configured'),
+  choosesWorkspace: z.boolean().describe('true when the operator configured a workspace probe for this host: work_start then accepts a workspace for named projects and picks one automatically'),
   reachable: z.boolean().nullable().describe('null when the gateway has no credential to ask with; true when T3 answered, even if it refused the credential'),
   t3Version: z.string().nullable(),
   checkedAt: z.string(),
@@ -40,8 +41,8 @@ const hostSchema = z.object({
   nativeReads: z
     .boolean()
     .describe(
-      "true: fleet_t3_tools and fleet_t3_call read this host's T3 (any thread on it), and work_adopt takes over its threads; " +
-        'false: the operator opted the host out',
+      "true: fleet_t3_tools and fleet_t3_call read this host's T3 through an allowlist of T3 read tools, any thread included; " +
+        'false: the operator opted the host out. work_adopt does not use this flag',
     ),
 });
 
@@ -53,7 +54,7 @@ const outputSchema = z.object({
       alias: z.string(),
       description: z.string(),
       host: z.string(),
-      workspaceMode: z.enum(['scratch', 'auto']).describe('scratch uses T3 internal scratch; auto detects a Git project root for a fresh wt from origin/main, otherwise uses root'),
+      workspaceMode: z.enum(['scratch', 'worktree']).describe('scratch uses T3 internal scratch; worktree creates a fresh git worktree and branch'),
       runtimeMode: z
         .enum(RUNTIME_MODES)
         .describe(
@@ -100,14 +101,15 @@ function describeHost(host: HostStatus): string {
           ? `credential rejected by T3 (the operator must run: t3-fleet-gateway hosts enroll ${host.id})`
           : `credential expires in ${host.credential.daysLeft} ${host.credential.daysLeft === 1 ? 'day' : 'days'}`;
   const renewal = host.credential.renewalError ? `, last renewal failed (${host.credential.renewalError.code})` : '';
-  const scratch = host.defaultProject === null ? '' : host.discovery.enabled
-    ? `; no named project: work_start { target: { host: ${JSON.stringify(host.id)} } } uses scratch alias ${host.defaultProject}`
-    : `; scratch alias ${host.defaultProject} (host-only starts need discovery enabled)`;
+  const scratch = host.defaultProject === null
+    ? ''
+    : `; no named project: work_start { target: { host: ${JSON.stringify(host.id)} } } uses scratch alias ${host.defaultProject}`;
+  const workspace = host.choosesWorkspace ? '; picks workspaces for named projects (work_start workspace)' : '';
   const discovery = host.discovery.enabled
     ? `; discovery on (fleet_projects, fleet_models${host.discovery.allowWorkStart ? '; work_start accepts target' : '; launches need a configured alias'})`
     : '';
-  const native = host.nativeReads ? '; native reads on (fleet_t3_tools, fleet_t3_call, work_adopt)' : '; native reads off';
-  return `${host.id}: ${reach}; ${credential}${renewal}; ${host.runningJobs} running, ${host.queuedJobs} queued (max ${host.maxConcurrentJobs})${discovery}${native}${scratch}`;
+  const native = host.nativeReads ? '; native reads on (fleet_t3_tools, fleet_t3_call)' : '; native reads off';
+  return `${host.id}: ${reach}; ${credential}${renewal}; ${host.runningJobs} running, ${host.queuedJobs} queued (max ${host.maxConcurrentJobs})${discovery}${native}${scratch}${workspace}`;
 }
 
 export function fleetStatusTool(deps: { config: GatewayConfig; registry: HostRegistry; db: Database; jobs: JobService }) {
@@ -129,7 +131,7 @@ export function fleetStatusTool(deps: { config: GatewayConfig; registry: HostReg
       'is refused there and the standing jobs are the way in. If the operator approved you for selected machines only, you ' +
       'see just those hosts and their projects, and every work tool works only with jobs on them. A host with discovery.enabled ' +
       'true also has T3 projects beyond these aliases and a model catalog: fleet_projects and fleet_models list them. On a host with ' +
-      'nativeReads true, fleet_t3_tools and fleet_t3_call read its T3 directly, any thread included, and work_adopt takes a thread over. Use this first ' +
+      'nativeReads true, fleet_t3_tools and fleet_t3_call read its T3 directly, any thread included. Use this first ' +
       'to learn the project aliases and where to send work, or to check why work is not progressing. Read-only; safe to call any time.',
     scope: READ_SCOPE,
     readOnly: true,
@@ -147,6 +149,7 @@ export function fleetStatusTool(deps: { config: GatewayConfig; registry: HostReg
             id: host.id,
             label: host.label ?? null,
             defaultProject: host.defaultProject ?? null,
+            choosesWorkspace: host.workspaceProbeCommand !== undefined,
             reachable: health.reachable,
             t3Version: health.t3Version,
             checkedAt: isoTime(health.checkedAt),
@@ -165,12 +168,13 @@ export function fleetStatusTool(deps: { config: GatewayConfig; registry: HostReg
           };
         }),
       );
-      const standing = deps.jobs.store.standingJobs().filter((job) => visible(job.hostId));
+      const standing = deps.jobs.store.standingJobs().filter((job) =>
+        visible(job.hostId) && (job.origin !== 'adopted' || context.scopes.includes(THREAD_READ_SCOPE)));
       const projects = deps.config.projects.filter((project) => visible(project.host)).map((project) => ({
         alias: project.alias,
         description: project.description,
         host: project.host,
-        workspaceMode: project.workspaceMode === 'scratch' ? 'scratch' as const : 'auto' as const,
+        workspaceMode: project.workspaceMode,
         runtimeMode: project.runtimeMode,
         modelConfigured: configuredModel(deps.config, project) !== null,
         allowWorkStart: project.allowWorkStart,

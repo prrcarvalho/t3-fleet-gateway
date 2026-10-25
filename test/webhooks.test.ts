@@ -10,6 +10,7 @@ import { parseConfig } from '../src/config.ts';
 import { openServices } from '../src/gateway.ts';
 import { silentLogger } from '../src/log.ts';
 import { HOUR, MINUTE } from '../src/time.ts';
+import { MAX_PAYLOAD_BYTES } from '../src/webhooks/store.ts';
 import { testClock, type TestClock } from './helpers/clock.ts';
 import { startFakeT3, type FakeT3 } from './helpers/fakeT3.ts';
 import type { FrontDoor } from './helpers/frontDoor.ts';
@@ -100,6 +101,8 @@ function subscription(url: string, extra: Record<string, unknown> = {}) {
 
 async function harness(t: TestContext, subscriptions: Record<string, unknown>[], options: {
   fake?: FakeT3; dataDir?: string; door?: FrontDoor; clock?: TestClock; attemptTimeoutMs?: number;
+  /** Extra fields for the host's config entry, and extra projects beside pilot and docs. */
+  host?: Record<string, unknown>; projects?: Record<string, unknown>[];
 } = {}) {
   const fake = options.fake ?? await startFakeT3();
   if (!options.fake) t.after(() => fake.close());
@@ -110,10 +113,11 @@ async function harness(t: TestContext, subscriptions: Record<string, unknown>[],
   }
   const gw = await startTestGateway(t, {
     config: {
-      hosts: [{ id: 'main', t3Url: fake.url, mintPairingCode: fake.mintCommand(), maxConcurrentJobs: 5 }],
+      hosts: [{ id: 'main', t3Url: fake.url, mintPairingCode: fake.mintCommand(), maxConcurrentJobs: 5, ...options.host }],
       projects: [
         { alias: 'pilot', host: 'main', t3ProjectId: 'project-1', runtimeMode: 'auto' },
         { alias: 'docs', host: 'main', t3ProjectId: 'project-2', runtimeMode: 'auto' },
+        ...(options.projects ?? []),
       ],
       webhooks: { subscriptions },
     },
@@ -189,7 +193,7 @@ describe('outbound job webhooks through MCP, watcher and HTTP', () => {
       const entry = entries[0]!;
       const payload = entry.payload;
       const thread = h.fake.threadForJob(job.jobId);
-      const event = feed.events.find((event) => event.jobId === job.jobId && event.toState === type);
+      const event = feed.events.find((event) => event.jobId === job.jobId && event.toState === (type === 'failed' ? 'idle' : type));
       assert.ok(event);
       assert.deepEqual({
         type: payload.type, state: payload.state, previousState: payload.previousState, feedSequence: payload.feedSequence,
@@ -197,7 +201,7 @@ describe('outbound job webhooks through MCP, watcher and HTTP', () => {
         title: payload.title, threadId: payload.threadId, link: payload.link, standing: payload.standing,
         waitingOnDelegatedWork: payload.waitingOnDelegatedWork, turnInitiator: payload.turnInitiator,
       }, {
-        type, state: type, previousState: 'running', feedSequence: Number(event.cursor), feedCursor: event.cursor,
+        type, state: type === 'failed' ? 'idle' : type, previousState: 'running', feedSequence: Number(event.cursor), feedCursor: event.cursor,
         projectAlias: 'pilot', host: 'main', projectId: 'project-1', title: job.title, threadId: thread.threadId,
         link: `t3-thread://v1/${thread.threadId}`, standing: false, waitingOnDelegatedWork: false,
         turnInitiator: { kind: 'gateway', clientId: h.agent.clientId },
@@ -233,13 +237,73 @@ describe('outbound job webhooks through MCP, watcher and HTTP', () => {
     await h.deliver();
     assert.equal(sink.received.length, 2);
     const early = sink.received.find((entry) => entry.payload.jobId === queued.jobId)!.payload;
-    // Named launches record the T3 project before queueing. The thread still does not exist.
     assert.deepEqual([early.type, early.previousState, early.threadId, early.link, early.projectId, early.turnInitiator],
-      ['cancelled', 'queued', null, null, 'project-1', { kind: 'unknown', clientId: null }]);
+      ['cancelled', 'queued', null, null, null, { kind: 'unknown', clientId: null }]);
     const running = sink.received.find((entry) => entry.payload.jobId === active.jobId)!.payload;
     assert.deepEqual([running.type, running.state, running.previousState], ['cancelled', 'cancelled', 'cancel_requested']);
     await h.deliver();
     assert.equal(sink.received.length, 2);
+  });
+
+  test('a scratch job is captured and delivered like any job: scratch alias, host and project id, no branch, launch attribution', async (t) => {
+    const scratchSink = await receiver(t);
+    const worktreeSink = await receiver(t);
+    const events = ['running', 'idle', 'cancelled'];
+    const h = await harness(t, [
+      subscription(scratchSink.url, { id: 'scratch', projects: ['scratch'], hosts: ['main'], events }),
+      subscription(worktreeSink.url, { id: 'worktrees', projects: ['pilot'], events }),
+    ], {
+      host: { discovery: { enabled: true }, defaultProject: 'scratch' },
+      projects: [{ alias: 'scratch', host: 'main', t3ProjectId: 'project-3', workspaceMode: 'scratch', runtimeMode: 'auto' }],
+    });
+    h.fake.scratchProjectId = 'project-3';
+    type Started = { job: { jobId: string; title: string; project: string; projectId: string; branch: string; workspaceMode: string } };
+    const start = (requestId: string, title: string) => h.agent.call<Started>('work_start', {
+      target: { host: 'main' }, task: 'Synthetic scratch task never sent to a webhook', title, requestId,
+    });
+    const { job } = await start('scratch-run', 'Synthetic scratch job');
+    const { job: queued } = await start('scratch-cancelled', 'Synthetic cancelled scratch job');
+    assert.deepEqual([job.project, job.projectId, job.branch, job.workspaceMode], ['scratch', 'project-3', '', 'scratch']);
+    await h.agent.call('work_cancel', { jobId: queued.jobId });
+    await h.tick();
+    const thread = h.fake.threadForJob(job.jobId);
+    assert.equal(thread.launch.scratch, true);
+    assert.equal(thread.projectId, 'project-3');
+    // The launch recorded who started the first run, as it does for a worktree launch.
+    const turns = h.gw.services.db.prepare('SELECT run_id, client_id FROM job_turns WHERE job_id = ?').all(job.jobId).map((row) => ({ ...row }));
+    assert.deepEqual(turns, [{ run_id: thread.runs[0]!.runId, client_id: h.agent.clientId }]);
+    h.fake.finishTurn(thread.threadId, 'Synthetic confidential scratch result');
+    await h.tick();
+    assert.equal(scratchSink.received.length, 0, 'job transitions commit without awaiting a receiver');
+    await h.deliver();
+
+    assert.deepEqual(scratchSink.received.map((entry) => [entry.payload.jobId, entry.payload.type]),
+      [[queued.jobId, 'cancelled'], [job.jobId, 'running'], [job.jobId, 'idle']]);
+    const feed = await h.agent.call<FeedPage>('work_feed');
+    const common = { projectAlias: 'scratch', host: 'main', projectId: 'project-3', standing: false, waitingOnDelegatedWork: false };
+    const launched = { threadId: thread.threadId, link: `t3-thread://v1/${thread.threadId}`, turnInitiator: { kind: 'gateway', clientId: h.agent.clientId } };
+    const expected = [
+      { jobId: queued.jobId, title: queued.title, type: 'cancelled', state: 'cancelled', previousState: 'queued', ...common,
+        threadId: null, link: null, turnInitiator: { kind: 'unknown', clientId: null } },
+      { jobId: job.jobId, title: job.title, type: 'running', state: 'running', previousState: 'dispatching', ...common, ...launched },
+      { jobId: job.jobId, title: job.title, type: 'idle', state: 'idle', previousState: 'running', ...common, ...launched },
+    ];
+    scratchSink.received.forEach(({ payload }, index) => {
+      const event = feed.events.find((candidate) => candidate.cursor === payload.feedCursor);
+      assert.ok(event, 'every delivery names a feed event');
+      assert.deepEqual([event.jobId, event.toState], [payload.jobId, payload.state]);
+      assert.deepEqual({
+        jobId: payload.jobId, title: payload.title, type: payload.type, state: payload.state, previousState: payload.previousState,
+        projectAlias: payload.projectAlias, host: payload.host, projectId: payload.projectId, standing: payload.standing,
+        waitingOnDelegatedWork: payload.waitingOnDelegatedWork, threadId: payload.threadId, link: payload.link, turnInitiator: payload.turnInitiator,
+      }, expected[index]);
+      assert.equal(payload.feedSequence, Number(event.cursor));
+      assert.equal('branch' in payload, false, 'a webhook never carries a branch');
+    });
+    assert.equal(worktreeSink.received.length, 0, 'the project filter matches the scratch alias, not the pilot worktree project');
+    const serialized = JSON.stringify(scratchSink.received.map((entry) => entry.payload));
+    for (const secret of ['never sent to a webhook', 'confidential scratch result', HEADER_VALUE]) assert.equal(serialized.includes(secret), false);
+    assertNotLogged(h.gw, [scratchSink.url, HEADER_VALUE, 'confidential scratch result']);
   });
 
   test('delegated_work_ended and an entire unseen turn each produce one snapshot with unknown attribution', async (t) => {
@@ -806,4 +870,96 @@ describe('webhook transport safety and operator checks', () => {
     assert.equal(invalid.code, 1);
     assert.equal(sink.received.length, 1, 'an invalid credential never results in an unauthenticated test request');
   });
+});
+
+test('opt-in PR webhooks deliver bounded references once, with feed sequences and no worker metadata', async (t) => {
+  const sink = await receiver(t);
+  const h = await harness(t, [subscription(sink.url, { events: ['pull_request_opened', 'pull_request_merged'] })]);
+  const job = await startJob(h.agent);
+  await h.tick();
+  const { threadId } = h.fake.threadForJob(job.jobId);
+  const pr = { host: 'github.com', repository: 'sample/widgets', number: 21,
+    url: 'https://github.com/sample/widgets/pull/21', state: 'open', title: 'PRIVATE-PR-TITLE', headBranch: 'PRIVATE-BRANCH' };
+  h.fake.pullRequests.set(threadId, [pr]);
+  h.gw.clock.advance(MINUTE + 1);
+  await h.tick();
+  await h.deliver();
+  h.gw.clock.advance(MINUTE + 1);
+  await h.tick();
+  await h.deliver();
+  h.fake.pullRequests.set(threadId, [{ ...pr, state: 'merged' }]);
+  h.gw.clock.advance(MINUTE + 1);
+  await h.tick();
+  await h.deliver();
+  assert.deepEqual(sink.received.map((r) => r.payload.type), ['pull_request_opened', 'pull_request_merged']);
+  assert.equal(new Set(sink.received.map((r) => r.payload.eventId)).size, 2);
+  for (const entry of sink.received) {
+    const body = JSON.parse(entry.body);
+    assert.deepEqual(body.pullRequests, [{ number: 21, state: body.type === 'pull_request_opened' ? 'open' : 'merged', url: pr.url }]);
+    assert.equal(entry.body.includes('PRIVATE-'), false);
+    const event = h.gw.services.jobs.store.recentEvents(job.jobId, 100).find((e) => e.id === body.feedSequence);
+    assert.equal(event?.type, body.type);
+  }
+  assertNotLogged(h.gw, ['PRIVATE-PR-TITLE', 'PRIVATE-BRANCH', pr.url]);
+});
+
+test('PR webhooks carry at most twenty PRs, open ones first, from a job that follows two hundred, and stay inside the payload bound', async (t) => {
+  const sink = await receiver(t);
+  const h = await harness(t, [subscription(sink.url, { events: ['pull_request_opened', 'pull_request_merged'] })]);
+  const job = await startJob(h.agent);
+  await h.tick();
+  const { threadId } = h.fake.threadForJob(job.jobId);
+  // 205 linked PRs in a repository with a long name, #3 and #205 open and the rest merged: the job follows 200, the payload shows 20.
+  const repository = `sample/${'w'.repeat(60)}`;
+  h.fake.pullRequests.set(threadId, Array.from({ length: 205 }, (_, i) => ({
+    host: 'github.com', repository, number: i + 1, url: `https://github.com/${repository}/pull/${i + 1}`,
+    state: i + 1 === 3 || i + 1 === 205 ? 'open' : 'merged',
+  })));
+  h.gw.clock.advance(MINUTE + 1);
+  await h.tick();
+  await h.deliver();
+  const followed = h.gw.services.jobs.store.require(job.jobId).pullRequests!;
+  assert.equal(followed.length, 200);
+  const everything = JSON.stringify(followed.map(({ number, state, url }) => ({ number, state, url })));
+  assert.ok(Buffer.byteLength(everything) > MAX_PAYLOAD_BYTES, 'sending every PR the job follows would overflow the payload bound');
+  // Both events arrive: neither was dropped for size.
+  assert.deepEqual(sink.received.map((r) => r.payload.type).sort(), ['pull_request_merged', 'pull_request_opened']);
+  for (const entry of sink.received) {
+    assert.ok(Buffer.byteLength(entry.body) <= MAX_PAYLOAD_BYTES, 'inside the bound');
+    const body = JSON.parse(entry.body) as { pullRequests: { number: number; state: string; url: string }[] };
+    const newest = Array.from({ length: 18 }, (_, i) => 204 - i);
+    assert.deepEqual(body.pullRequests.map((p) => p.number), [205, 3, ...newest], 'twenty: the open ones, then the newest');
+    assert.deepEqual(Object.keys(body.pullRequests[0]!).sort(), ['number', 'state', 'url']);
+  }
+});
+
+test('worker failures notify as failed with recoverable idle state; recovery emits once', async (t) => {
+  const sink = await receiver(t);
+  const h = await harness(t, [subscription(sink.url, { projects: ['pilot'], events: ['failed', 'running', 'idle'] })]);
+  const job = await startJob(h.agent);
+  await h.tick();
+  await h.deliver();
+  sink.received.length = 0;
+  const thread = h.fake.threadForJob(job.jobId);
+  h.fake.failRun(thread.threadId);
+  await h.tick();
+  await h.deliver();
+  assert.deepEqual(sink.received.map((r) => [r.payload.type, r.payload.state]), [['failed', 'idle']]);
+  h.gw.clock.advance(2 * MINUTE);
+  await h.tick();
+  await h.deliver();
+  assert.equal(sink.received.length, 1);
+  h.fake.userTurn(thread.threadId, 'Synthetic recovery');
+  h.gw.clock.advance(2 * MINUTE);
+  await h.tick();
+  await h.deliver();
+  assert.deepEqual(sink.received.map((r) => [r.payload.type, r.payload.state]), [['failed', 'idle'], ['running', 'running']]);
+  assert.deepEqual(sink.received[1]!.payload.turnInitiator, { kind: 'unknown', clientId: null });
+  await h.tick();
+  await h.deliver();
+  assert.equal(sink.received.length, 2);
+  h.fake.finishTurn(thread.threadId, 'Synthetic completion');
+  await h.tick();
+  await h.deliver();
+  assert.equal(sink.received.at(-1)!.payload.type, 'idle');
 });

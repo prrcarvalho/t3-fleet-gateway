@@ -8,6 +8,8 @@ const T0 = '2026-01-15T12:00:00.000Z';
 
 function job(overrides: Partial<Job> = {}): Job {
   return {
+    pullRequests: null,
+    pullRequestsCheckedAt: null,
     id: 'job1',
     clientId: 'c',
     requestId: 'r',
@@ -38,8 +40,17 @@ function job(overrides: Partial<Job> = {}): Job {
     dispatchStartedAt: 0,
     finishedAt: null,
     launchSpec: null,
+    launchSpecUnreadable: false,
+    workspaceKind: null,
+    workspaceRootKey: null,
+    workspaceRootHeldAt: null,
+    workspaceResumeTokens: [],
+    probeAttempts: 0,
+    probeRetryAt: null,
     standing: false,
-    adopted: false,
+    origin: 'gateway',
+    adoptedBy: null,
+    adoptedAt: null,
     delegatedWork: [],
     delegatedUntracked: 0,
     delegatedUntrackedRunId: null,
@@ -121,18 +132,9 @@ describe('state derivation', () => {
     }
   });
 
-  test('a failed run fails the job', () => {
+  test('a failed run leaves the job idle and recoverable', () => {
     const seen = observe(job(), read({ status: 'failed' }, [{ runId: 'run-1', status: 'failed' }]), []);
-    assert.deepEqual([seen.state, seen.errorCode], ['failed', 't3_run_failed']);
-  });
-
-  test('an idle job already settled on a failed run stays idle with the error; a later failed run fails it', () => {
-    const failedRead = read({ status: 'failed' }, [{ runId: 'run-1', status: 'failed' }]);
-    const settled = observe(job({ state: 'idle', lastRunId: 'run-1' }), failedRead, []);
-    assert.deepEqual([settled.state, settled.errorCode, settled.anotherTurnFinished], ['idle', 't3_run_failed', false]);
-    const newer = read({ status: 'failed', latestRunId: 'run-2' }, [{ runId: 'run-2', status: 'failed' }, { runId: 'run-1', status: 'failed' }]);
-    const later = observe(job({ state: 'idle', lastRunId: 'run-1' }), newer, []);
-    assert.deepEqual([later.state, later.errorCode], ['failed', 't3_run_failed']);
+    assert.deepEqual([seen.state, seen.errorCode], ['idle', 't3_run_failed']);
   });
 
   test('a failed run leaves a standing job idle, with the error', () => {
@@ -263,6 +265,12 @@ describe('delegated work', () => {
 });
 
 describe('thread links', () => {
+  test('keeps raw legacy MCP links from T3 and older jobs', () => {
+    const link = 't3-thread://v1/mcp:11111111-2222-4333-8444-555555555555';
+    assert.equal(threadLinkTarget(link), link);
+    assert.equal(threadLinkTarget(`[Synthetic thread](${link})`), link);
+  });
+
   test('takes the URL out of the markdown link T3 returns', () => {
     assert.equal(threadLinkTarget('[Fix (the) parser [job:abc]](t3-thread://v1/env-synthetic/thread-1)'), 't3-thread://v1/env-synthetic/thread-1');
     assert.equal(threadLinkTarget('https://t3.example.com/threads/thread-1'), 'https://t3.example.com/threads/thread-1');
