@@ -1,5 +1,4 @@
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import type { TestContext } from 'node:test';
 import { parseConfig } from '../../src/config.ts';
 import { startGateway, type GatewayOptions, type GatewayServices, type RunningGateway } from '../../src/gateway.ts';
@@ -36,6 +35,7 @@ export async function startTestGateway(
     door?: FrontDoor;
     clock?: TestClock;
     jobEngine?: GatewayOptions['jobEngine'];
+    reachability?: GatewayOptions['reachability'];
     webhookSender?: GatewayOptions['webhookSender'];
     webhookManagement?: GatewayOptions['webhookManagement'];
     runCommand?: GatewayOptions['runCommand'];
@@ -44,13 +44,11 @@ export async function startTestGateway(
 ): Promise<TestGateway> {
   const door = options.door ?? (await openFrontDoor(t));
   const baseUrl = door.url;
-  const configuredHosts = options.config?.hosts;
-  const hosts = Array.isArray(configuredHosts) ? configuredHosts : [{ id: 'main', t3Url: 'http://127.0.0.1:9' }];
   const config = parseConfig({
     publicUrl: baseUrl,
     listen: { host: '127.0.0.1', port: door.port },
+    hosts: [{ id: 'main', t3Url: 'http://127.0.0.1:9' }],
     ...options.config,
-    hosts: hosts.map((host) => ({ workspaceProbeCommand: [process.execPath, fileURLToPath(new URL('./workspaceProbe.js', import.meta.url))], ...host })),
   });
   const dataDir = options.dataDir ?? join(tempDir(t), 'data');
   const clock = options.clock ?? testClock(Date.now());
@@ -64,6 +62,7 @@ export async function startTestGateway(
     port: 0,
     // Used only when the config enables the dashboard: its listener also takes a port the OS picks.
     dashboardPort: 0,
+    reachability: options.reachability ?? { autoStart: false },
     ...(options.webhookSender ? { webhookSender: options.webhookSender } : {}),
     ...(options.webhookManagement ? { webhookManagement: options.webhookManagement } : {}),
     ...(options.tools ? { tools: options.tools } : {}),

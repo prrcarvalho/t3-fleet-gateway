@@ -54,9 +54,11 @@ export interface FakeItem {
 /** A model option as T3 advertises it in orchestrator_capabilities (a `select` with choices, or a `boolean`). */
 export interface FakeOption {
   id: string;
-  label: string;
+  label?: string;
+  values?: (string | boolean)[];
+  default?: string | boolean;
   description?: string;
-  type: 'select' | 'boolean' | string;
+  type?: 'select' | 'boolean' | string;
   options?: { id: string; label: string; description?: string; isDefault?: boolean }[];
   currentValue?: string | boolean;
 }
@@ -121,15 +123,17 @@ export interface FakeThread {
   items: FakeItem[];
   questions: Map<string, FakeQuestion[] | null>;
   approvalsPending: number;
-  /** Settled threads are listed only when t3_thread_list is asked for them (`settled: true`). */
+  /** Current T3 lists both shelves when settled is omitted. */
   settled: boolean;
-  /** Archived threads are readable by id but never listed or searched, and refuse messages. */
-  archived: boolean;
+  /** Archived threads are readable by id but left out of list and search. */
+  archived?: boolean;
   createdBy: 'user' | 'agent';
   creationSource: 'mcp' | 'web';
   createdAt: string;
   updatedAt: string;
   launch: Record<string, unknown>;
+  /** A scratch thread's own folder, which T3 creates for it; null for a thread in a project's root or worktree. */
+  scratchFolder: string | null;
 }
 
 /** Made-up environment id, used in thread links the way T3 builds them. */
@@ -141,6 +145,13 @@ const ACTIVE = new Set(['preparing', 'queued', 'starting', 'running', 'waiting']
 /** Item types t3_thread_read's messages view returns; the activity view returns every item. */
 const MESSAGE_VIEW_TYPES = new Set(['user_message', 'assistant_message', 'proposed_plan']);
 const nullable = <T extends z.ZodType>(schema: T) => schema.nullable().optional();
+
+const attachmentMetadata = z.strictObject({
+  type: z.enum(['image', 'file']), id: z.string(), name: z.string(), mimeType: z.string(), sizeBytes: z.int().min(1),
+});
+const attachmentUploadInput = z.strictObject({ upload: attachmentMetadata.omit({ id: true }) });
+const attachmentSendInput = z.strictObject({ threadId: z.string().optional(), message: z.string().max(120000).optional(),
+  attachments: z.array(attachmentMetadata).min(1).max(8) });
 
 /** Input schemas copied field-for-field from T3's tools, strict so a misspelled field fails the test. */
 const launchInput = z.strictObject({
@@ -158,7 +169,7 @@ const launchInput = z.strictObject({
     ]),
   ),
   message: nullable(z.string().max(120000)),
-  attachments: nullable(z.array(z.unknown()).max(8)),
+  attachments: nullable(z.array(attachmentMetadata).max(8)),
 });
 const readInput = z.strictObject({
   threadId: z.string(),
@@ -234,18 +245,23 @@ interface Session {
 export class FakeT3 {
   readonly serverVersion: string;
   tokenLifetimeSeconds: number;
-  readonly projects: { workspaceRoot?: string; id: string; title: string; deletedAt: string | null; defaultModelSelection: Record<string, unknown> | null }[];
+  /** `workspaceRoot` is the folder T3 reports for the project; the workspace probe reads it (src/jobs/workspace.ts). */
+  readonly projects: { id: string; title: string; deletedAt: string | null; defaultModelSelection: Record<string, unknown> | null; workspaceRoot?: string }[];
   /** The providers, models and options this host advertises in orchestrator_capabilities; tests change it between calls. */
   providers: FakeProvider[] = syntheticProviders();
   /** When set, t3_project_list answers every page with this same nextCursor (a catalog that never converges). */
   projectListStuckCursor: number | null = null;
+  /** How many `tools/list` requests arrived. */
+  toolListings = 0;
+  /** Tool name to a JSON-RPC error code answered instead of running the tool, as T3 refuses a call at the protocol level. */
+  readonly protocolErrors = new Map<string, number>();
+  /** Tools this host does not offer (an older T3): not advertised and not callable. Takes effect for sessions started after it is set. */
+  readonly omitTools = new Set<string>();
   /** Tool name to a T3 failure returned instead of a result. */
   readonly failures = new Map<string, { code: string; message: string }>();
   /** Tool name to a T3 failure returned after the call has taken effect (for example a launch that created the thread). */
   readonly failuresAfterEffect = new Map<string, { code: string; message: string }>();
   readonly calls: string[] = [];
-  /** How many `tools/list` requests arrived. */
-  toolListings = 0;
   /** Every t3_thread_read input, in order (view, positions and sizes), for tests of the read pattern. */
   readonly reads: z.output<typeof readInput>[] = [];
   readonly validTokens = new Set<string>();
@@ -262,28 +278,36 @@ export class FakeT3 {
   readonly dropResponseOnce = new Set<string>();
   /** Tools whose next call is answered with this bare HTTP status instead of running. */
   readonly statusOnce = new Map<string, number>();
-  /** Tool name to a JSON-RPC error code answered instead of running the tool, as T3 refuses a call at the protocol level. */
-  readonly protocolErrors = new Map<string, number>();
   /** Threads whose t3_thread_read answers in a shape that does not match T3's schema. */
   readonly brokenReads = new Set<string>();
+  /** Synthetic older/malformed detail fields, applied before the MCP result is serialized. */
+  readonly threadDetailOverrides = new Map<string, Record<string, unknown>>();
   /** Thread id to a T3 failure returned by t3_thread_read for that thread only. */
   readonly readFailures = new Map<string, { code: string; message: string }>();
   /**
    * Tools whose calls take effect but whose answer is held back until releaseHeld() or stop(). `initialize` holds a new
-   * session's MCP initialization before it is handled (a client still connecting).
+   * session's MCP initialization before it is handled (a client still connecting); `notifications/initialized`
+   * holds the final initialization notification's HTTP acknowledgement.
    */
   readonly holdResponses = new Set<string>();
+  /**
+   * The project T3 files `scratch: true` threads under (its internal scratch project). Tests pin their scratch aliases to it;
+   * set it to another id to model a pin that is not T3's scratch project.
+   */
+  scratchProjectId = 'project-1';
   /** When set, t3_thread_launch creates the thread but starts no run on it (thread `idle`, no runs). */
   launchWithoutRun = false;
+  /** A synthetic T3-minted id for the next launch. */
+  nextThreadId: string | undefined;
   /** Older T3 versions supplied links; current published thread tools omit them. */
   legacyThreadLinks = false;
   /** When set, interrupts are accepted but take effect only on completeInterrupts(). */
   deferInterrupts = false;
   /** When set, an interrupt leaves the thread's pending questions listed (T3 may keep them). */
   keepQuestionsOnInterrupt = false;
-  /** Tools this host does not offer (an older T3): not advertised and not callable. Takes effect for sessions started after it is set. */
-  readonly omitTools = new Set<string>();
   readonly threads = new Map<string, FakeThread>();
+  /** Synthetic raw pages, including malformed entries and offset-page movement. */
+  readonly threadListPages = new Map<number, Record<string, unknown>>();
   readonly sends: { threadId: string; message: string; clientRequestId: string | null }[] = [];
   readonly responses: { threadId: string; requestId: string; answers: Record<string, unknown> }[] = [];
   #sequence = 0;
@@ -363,6 +387,7 @@ export class FakeT3 {
   /** A person types into the thread in T3, starting a new turn. */
   userTurn(threadId: string, text: string): void {
     const thread = this.#thread(threadId);
+    thread.settled = false;
     const run = this.#startRun(thread);
     this.#addItem(thread, { runId: run.runId, createdBy: 'user', creationSource: 'web', type: 'user_message', text });
   }
@@ -475,7 +500,7 @@ export class FakeT3 {
     return this.#launch(launchInput.parse(input)) as { threadId: string };
   }
 
-  /** A person starts a thread in the T3 app: created by the user from the web UI, its first message starting a run. */
+  /** A thread a person started in the T3 app: created by the user, source `web`, so it is not a gateway launch. */
   startInApp(input: { projectId: string; title: string; message: string; runtimeMode?: string }): { threadId: string } {
     const { threadId } = this.launchDirect(input);
     const thread = this.#thread(threadId);
@@ -484,6 +509,7 @@ export class FakeT3 {
     return { threadId };
   }
 
+  /** Leave the thread out of list and search; a read by id still returns it with `archived: true`. */
   archiveThread(threadId: string): void {
     this.#thread(threadId).archived = true;
   }
@@ -503,9 +529,10 @@ export class FakeT3 {
     return new Promise((resolve) => this.#holdWaiters.push({ tool, resolve }));
   }
 
-  /** Send every held answer. */
-  releaseHeld(): void {
-    for (const held of this.#held.splice(0)) held.release();
+  /** Send every held answer, or only the `first` or `last` one to be held (callers in flight finish in the order the test chooses). */
+  releaseHeld(which: 'all' | 'first' | 'last' = 'all'): void {
+    const released = which === 'all' ? this.#held.splice(0) : this.#held.splice(which === 'first' ? 0 : this.#held.length - 1, 1);
+    for (const held of released) held.release();
   }
 
   /** Apply interrupts accepted while deferInterrupts was set. */
@@ -559,8 +586,28 @@ export class FakeT3 {
     this.#sessions.clear();
   }
 
+  readonly uploads = new Map<string, { metadata: z.infer<typeof attachmentMetadata>; bytes: Buffer | null }>();
+  readonly attachmentSends: z.infer<typeof attachmentSendInput>[] = [];
+  uploadRelativeUrl: string | undefined;
+  uploadStatus = 200;
+
+  #checkAttachments(items: z.infer<typeof attachmentMetadata>[]): void {
+    for (const item of items) {
+      const stored = this.uploads.get(item.id);
+      if (!stored?.bytes || Object.entries(stored.metadata).some(([key, value]) => item[key as keyof typeof item] !== value)) throw new FakeFailure('invalid_request', 'Missing upload.');
+    }
+  }
+
   async #handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const path = new URL(req.url ?? '/', this.url).pathname;
+    if (path.startsWith('/api/attachments/upload/')) {
+      const stored = this.uploads.get(path.split('/').at(-1)!);
+      const bytes = await readBody(req, 6 * 1024 * 1024);
+      if (!stored || stored.metadata.sizeBytes !== bytes.length) { res.writeHead(400).end(); return; }
+      stored.bytes = bytes;
+      res.writeHead(this.uploadStatus).end();
+      return;
+    }
     const body = req.method === 'POST' ? await readBody(req, 1024 * 1024) : undefined;
     const json = (status: number, value: unknown) => {
       res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(value));
@@ -628,22 +675,23 @@ export class FakeT3 {
       res.writeHead(401, { 'www-authenticate': `Bearer resource_metadata="${this.url}/.well-known/oauth-protected-resource"` }).end();
       return;
     }
+    if (isToolsList(body)) this.toolListings += 1;
     const injected = toolName(body);
-    const status = injected === undefined ? undefined : this.statusOnce.get(injected);
-    if (injected !== undefined && status !== undefined) {
-      this.statusOnce.delete(injected);
-      res.writeHead(status).end();
-      return;
-    }
     const protocolError = injected === undefined ? undefined : this.protocolErrors.get(injected);
     if (protocolError !== undefined) {
       const error = { code: protocolError, message: `Synthetic protocol refusal of ${injected}` };
       res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', id: rpcId(body), error }));
       return;
     }
+    const status = injected === undefined ? undefined : this.statusOnce.get(injected);
+    if (injected !== undefined && status !== undefined) {
+      this.statusOnce.delete(injected);
+      res.writeHead(status).end();
+      return;
+    }
     const sessionId = req.headers['mcp-session-id'];
     if (sessionId === undefined && this.holdResponses.has('initialize') && isInitialize(body)) await this.#hold('initialize');
-    if (isToolsList(body)) this.toolListings += 1;
+    if (this.holdResponses.has('notifications/initialized') && isInitialized(body)) await this.#hold('notifications/initialized');
     let transport: WebStandardStreamableHTTPServerTransport;
     if (typeof sessionId === 'string') {
       const session = this.#sessions.get(sessionId);
@@ -672,6 +720,9 @@ export class FakeT3 {
     await sendWebResponse(res, response);
   }
 
+  readonly pullRequests = new Map<string, Record<string, unknown>[]>();
+  inlinePullRequests = false;
+
   #buildServer(): McpServer {
     const server = new McpServer({ name: 'T3 Code', version: this.serverVersion });
     const run = async (tool: string, produce: () => Record<string, unknown>) => {
@@ -698,22 +749,27 @@ export class FakeT3 {
     const tool = <S extends z.ZodObject>(name: string, input: S, produce: (args: z.output<S>) => Record<string, unknown>) => {
       if (!this.omitTools.has(name)) server.registerTool(name, { inputSchema: input as z.ZodObject }, (args: unknown) => run(name, () => produce(args as z.output<S>)));
     };
-    tool('t3_environment_read', z.object({}).loose(), () => ({
-      environmentId: FAKE_ENVIRONMENT_ID,
-      label: 'Synthetic host',
-      serverVersion: this.serverVersion,
-      platform: { os: 'linux', arch: 'x64' },
-      preferences: { backgroundActivity: { profile: 'balanced' } },
+    if (!this.omitTools.has('t3_environment_read')) server.registerTool('t3_environment_read', { inputSchema: z.object({}).loose() }, () =>
+      run('t3_environment_read', () => ({
+        environmentId: FAKE_ENVIRONMENT_ID,
+        label: 'Synthetic host',
+        serverVersion: this.serverVersion,
+        platform: { os: 'linux', arch: 'x64' },
+        preferences: { backgroundActivity: { profile: 'balanced' } },
+      })),
+    );
+    tool('list_thread_pull_requests', z.strictObject({ threadId: z.string() }), ({ threadId }) => ({
+      pullRequests: this.pullRequests.get(threadId) ?? [],
     }));
     tool('t3_project_list', projectListInput, ({ cursor, limit }) => {
       const start = cursor ?? 0;
       const size = limit ?? 50;
-      const page = this.projects.slice(start, start + size).map((project) => ({ workspaceRoot: `/synthetic/${project.id}`, ...project }));
+      const page = this.projects.slice(start, start + size);
       if (this.projectListStuckCursor !== null) return { projects: page, nextCursor: this.projectListStuckCursor };
       return { projects: page, nextCursor: start + size < this.projects.length ? start + size : null };
     });
     tool('t3_project_read', projectReadInput, ({ projectId }) => {
-      const project = this.projects.find((candidate) => candidate.id === projectId && !candidate.deletedAt);
+      const project = this.projects.find((candidate) => candidate.id === projectId);
       if (!project) throw new FakeFailure('project_not_found', 'No such project.');
       return { workspaceRoot: `/synthetic/${project.id}`, scripts: [], ...project };
     });
@@ -735,7 +791,23 @@ export class FakeT3 {
         maxBatchThreads: 10,
       },
     }));
-    tool('t3_thread_launch', launchInput, (input) => this.#launch(input));
+    tool('t3_attachment_prepare_upload', attachmentUploadInput, ({ upload }) => {
+      const id = `pending-${randomUUID()}`;
+      const metadata = { ...upload, id };
+      this.uploads.set(id, { metadata, bytes: null });
+      return { attachmentId: id, relativeUrl: this.uploadRelativeUrl ?? `/api/attachments/upload/${id}`, expiresAt: Date.now() + 600000 };
+    });
+    tool('t3_thread_send_attachments', attachmentSendInput, (input) => {
+      this.#checkAttachments(input.attachments);
+      this.attachmentSends.push(input);
+      const sent = this.#send({ threadId: input.threadId!, message: input.message ?? '' });
+      const { delivery, ...result } = sent;
+      return result;
+    });
+    tool('t3_thread_launch', launchInput, (input) => {
+      this.#checkAttachments(input.attachments ?? []);
+      return this.#launch(input);
+    });
     tool('t3_thread_read', readInput, (input) => {
       this.reads.push(input);
       const failure = this.readFailures.get(input.threadId);
@@ -743,13 +815,15 @@ export class FakeT3 {
       return this.brokenReads.has(input.threadId) ? { thread: { threadId: input.threadId } } : this.#read(input);
     });
     tool('t3_thread_list', listInput, (input) => {
+      const overridden = this.threadListPages.get(input.cursor ?? 0);
+      if (overridden) return overridden;
       const projectId = this.#target(input.projectId);
       const matching = [...this.threads.values()]
         .filter(
           (thread) =>
-            thread.projectId === projectId &&
-            !thread.archived &&
-            thread.settled === (input.settled ?? false) &&
+            thread.projectId === projectId && !thread.archived &&
+            (input.includeSubagents !== false || !this.#delegations.has(thread.threadId)) &&
+            (input.settled == null || thread.settled === input.settled) &&
             (!input.titleContains || thread.title.includes(input.titleContains)),
         )
         .reverse();
@@ -773,6 +847,20 @@ export class FakeT3 {
           return hit === undefined ? [] : [{ threadId: thread.threadId, projectId, source: 'user', snippet: hit.slice(0, 240), messageCreatedAt: null }];
         });
       return { matches: matches.slice(0, input.limit ?? 10) };
+    });
+    tool('t3_thread_organize', z.strictObject({ threadId: z.string(), action: z.literal('settle') }), ({ threadId }) => {
+      const thread = this.#thread(threadId);
+      if (this.#activeRun(thread)) throw new FakeFailure('orchestration_error', 'Thread is still running. Stop it before settling.');
+      if (thread.runs.some((run) => run.status === 'queued')) {
+        throw new FakeFailure('orchestration_error', 'Thread has a queued message. Send it or remove it from the queue before settling.');
+      }
+      if (thread.approvalsPending) {
+        throw new FakeFailure('orchestration_error', 'Thread is waiting on an approval or question. Answer it before settling.');
+      }
+      thread.questions.clear();
+      thread.settled = true;
+      thread.updatedAt = new Date().toISOString();
+      return { sequence: 1 };
     });
     tool('t3_thread_send', sendInput, (input) => this.#send(input));
     tool('t3_thread_interrupt', interruptInput, (input) => {
@@ -926,13 +1014,20 @@ export class FakeT3 {
   }
 
   #launch(input: z.output<typeof launchInput>): Record<string, unknown> {
-    const projectId = this.#target(input.projectId);
+    // As T3 does: `scratch` is exclusive with a project and a workspace strategy, and T3 files the thread under its scratch project.
+    if (input.scratch) {
+      if (input.projectId || input.workspaceStrategy) {
+        throw new FakeFailure('invalid_request', 'scratch cannot be combined with projectId or workspaceStrategy.');
+      }
+    }
+    const projectId = input.scratch ? this.scratchProjectId : this.#target(input.projectId);
     const project = this.projects.find((candidate) => candidate.id === projectId);
     if (!project) throw new FakeFailure('project_not_found', 'No such project.');
     if (!input.modelSelection && !project.defaultModelSelection) {
       throw new FakeFailure('invalid_request', 'Pass modelSelection: the project has no default model. orchestrator_capabilities lists providers and models.');
     }
-    const threadId = `thread-${this.threads.size + 1}`;
+    const threadId = this.nextThreadId ?? `thread-${this.threads.size + 1}`;
+    this.nextThreadId = undefined;
     const now = new Date().toISOString();
     const strategy = input.workspaceStrategy;
     const thread: FakeThread = {
@@ -948,12 +1043,12 @@ export class FakeT3 {
       questions: new Map(),
       approvalsPending: 0,
       settled: false,
-      archived: false,
       createdBy: 'agent',
       creationSource: 'mcp',
       createdAt: now,
       updatedAt: now,
       launch: input,
+      scratchFolder: input.scratch ? `/synthetic/scratch/${threadId}` : null,
     };
     this.threads.set(threadId, thread);
     let run: FakeRun | undefined;
@@ -977,6 +1072,7 @@ export class FakeT3 {
     if (previous) return previous;
     const thread = this.#thread(input.threadId);
     if (thread.archived) throw new FakeFailure('thread_not_sendable', `Thread ${thread.threadId} is archived and cannot receive messages.`);
+    thread.settled = false;
     this.sends.push({ threadId: thread.threadId, message: input.message, clientRequestId: input.clientRequestId ?? null });
     const active = this.#activeRun(thread);
     const run = active ?? this.#startRun(thread);
@@ -1006,12 +1102,13 @@ export class FakeT3 {
       runtimeMode: thread.runtimeMode,
       interactionMode: 'default',
       linkedPullRequest: null,
+      ...(this.inlinePullRequests ? { pullRequests: this.pullRequests.get(thread.threadId) ?? [] } : {}),
       settled: thread.settled,
       settledAt: thread.settled ? thread.updatedAt : null,
       snoozed: false,
       snoozedUntil: null,
-      parentThreadId: null,
-      relationshipToParent: null,
+      parentThreadId: this.#delegations.get(thread.threadId)?.parentThreadId ?? null,
+      relationshipToParent: this.#delegations.has(thread.threadId) ? 'subagent' : null,
       itemCount: thread.items.length,
       createdAt: thread.createdAt,
       updatedAt: thread.updatedAt,
@@ -1046,7 +1143,8 @@ export class FakeT3 {
         worktreePath: null,
         runCount: thread.runs.length,
         pendingRequestCount: thread.questions.size + thread.approvalsPending,
-        archived: thread.archived,
+        archived: thread.archived ?? false,
+        ...this.threadDetailOverrides.get(thread.threadId),
       },
       recentRuns: thread.runs.slice(-(input.runLimit ?? 10)).reverse(),
       items: page.map((item) => ({
@@ -1064,17 +1162,25 @@ export class FakeT3 {
   }
 }
 
-function isInitialize(body: Buffer | undefined): boolean {
+function isToolsList(body: Buffer | undefined): boolean {
   try {
-    return (JSON.parse(body?.toString() ?? '') as { method?: unknown }).method === 'initialize';
+    return (JSON.parse(body?.toString() ?? '') as { method?: unknown }).method === 'tools/list';
   } catch {
     return false;
   }
 }
 
-function isToolsList(body: Buffer | undefined): boolean {
+function rpcId(body: Buffer | undefined): unknown {
   try {
-    return (JSON.parse(body?.toString() ?? '') as { method?: unknown }).method === 'tools/list';
+    return (JSON.parse(body?.toString() ?? '') as { id?: unknown }).id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function isInitialize(body: Buffer | undefined): boolean {
+  try {
+    return (JSON.parse(body?.toString() ?? '') as { method?: unknown }).method === 'initialize';
   } catch {
     return false;
   }
@@ -1089,10 +1195,14 @@ function toolName(body: Buffer | undefined): string | undefined {
   }
 }
 
-function rpcId(body: Buffer | undefined): unknown {
-  return (JSON.parse(body?.toString() ?? '') as { id?: unknown }).id;
-}
-
 export async function startFakeT3(options: FakeT3Options = {}): Promise<FakeT3> {
   return new FakeT3(options).start();
+}
+
+function isInitialized(body: Buffer | undefined): boolean {
+  try {
+    return (JSON.parse(body?.toString() ?? '') as { method?: unknown }).method === 'notifications/initialized';
+  } catch {
+    return false;
+  }
 }

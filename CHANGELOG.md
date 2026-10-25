@@ -1,18 +1,165 @@
 # Changelog
 
-## Unreleased
+## Fork sync onto upstream 0.2.1
+
+This fork's `main` is brought up to upstream tag v0.2.1. The 0.2.0 and 0.2.1 notes below are upstream's. Where they name a migration number, use the mapping in this section for a database this fork already migrated.
+
+### Schema versions on this fork
+
+Versions 1–13 are unchanged from this fork's previous `main` (`f6940e9`):
+
+- Version 12 is still a no-op barrier. It does not add workspace columns.
+- Version 13 still adds `jobs.adopted`. It is not upstream's pull-request migration.
+
+Upstream's migrations 12–17 are appended as versions 14–19, forward only:
+
+| This fork | Upstream | What it does |
+| --- | --- | --- |
+| 14 | 12 | Workspace reservation and probe columns |
+| 15 | 13 | Pull-request snapshots |
+| 16 | 14 | `origin`, `adopted_by`, `adopted_at`, thread-scope tables. Also copies `adopted = 1` and `standing = 0` to `origin = 'adopted'` |
+| 17 | 15 | Paired webhook-target version barrier (no data change) |
+| 18 | 16 | `failed` jobs with `t3_run_failed` and a thread become `idle` |
+| 19 | 17 | Private `job_launch_attachments` table |
+
+Stop every gateway process and back up the data directory before the first start. Any command that opens the database applies these migrations. They only move forward. Rolling back means restoring that backup. A ledger already at version 13 keeps `jobs.adopted`; do not reset `user_version` to replay upstream's version 13.
+
+### Tools
+
+- Kept: `fleet_t3_tools` and `fleet_t3_call`, on unless `hosts[].nativeReads` is false. They still forward the same thirteen T3 read tools.
+- `work_adopt` is upstream's tool: `{ host, projectId, threadId, requestId }`, with discovery enabled and both `threads:read` and `threads:control`. It records `origin: adopted` and does not hold a launch slot. The previous `{ host, threadId, title? }` signature is gone.
+- `fleet_threads` lists threads. Projectless scratch, automatic workspace selection, pull requests, `work_settle`, reachability checks, attachments and recoverable failed turns come from upstream. Open PR #3 (compact model options) is superseded by upstream's catalog parser.
+- A launch still records its thread and checks for another open follower in one transaction (`thread_already_followed`). The older slot recount is not kept, because an adopted job no longer holds a launch slot.
+
+Existing clients are not granted `threads:read` or `threads:control`. An operator adds them with `clients grant` before an agent can adopt or read an adopted job. Jobs this fork already stored with `adopted = 1` become `origin = 'adopted'` and need those scopes.
+
+Node 24.22.1 or a later 24.x, or 26.12.1 or newer, is required before this build will start.
+
+## 0.2.1 (2026-10-22)
+
+### Upgrading
+
+- **Database migrations 16 and 17, forward only.** Migration 16 makes existing worker turn failures recoverable: jobs with `t3_run_failed` and a thread become `idle`, preserving their error and history. Migration 17 adds private storage for queued launch attachments. Older builds refuse the newer ledger. Stop older gateway processes and back up the data directory before the first start. Running any command against the data directory migrates it. **Rolling back to 0.2.0 requires restoring that backup**, losing anything recorded since the upgrade.
+- Node requirements remain 24.22.1 or a later 24.x, or 26.12.1 or newer.
 
 ### Added
 
-- **Native reads**: `fleet_t3_tools { host }` lists the T3 read tools a host advertises, with live input schemas and the allowlisted names it lacks (`missing`); `fleet_t3_call { host, tool, arguments? }` forwards one call and returns T3's result unchanged. Agents with Read access can read any thread on the host, including threads the gateway did not start, and archived threads by id. Only an in-code allowlist of thirteen T3 read tools passes; writes, `t3_thread_wait`, thread-only tools and tools a later T3 adds are refused with `tool_not_allowed` before any T3 call. Results over 256 KiB are refused, never cut.
-- **`work_adopt { host, threadId, requestId, title? }`**: an agent with Operate access takes over an existing T3 thread as an ordinary job of its own, in the state observed from T3 (`running`, `needs_input` or `idle`), then drives it with the usual `work_*` tools. Idempotent on `requestId`; a thread an open job already follows returns that job (`created: false`), and so does a thread whose launch the gateway has not confirmed yet, found by the `[job:<id>]` marker in its title. A launch confirmed after another job took its thread over ends `failed` with `thread_already_followed`. Archived threads and threads whose runtime mode is above the host's `access` are refused. Adopted jobs keep the thread's workspace and runtime mode, hold a concurrency slot while a turn is in progress, even past `maxConcurrentJobs` (queued launches wait), and are marked `adopted` in job views.
-- `hosts[].nativeReads` (default `true`) turns the three tools off for a host (`native_reads_disabled`); `fleet_status` shows it per host. Independent of discovery.
-- Migration 13 adds `jobs.adopted`. Older builds refuse a ledger at version 13: stop them before upgrading, and downgrade from a pre-upgrade backup.
+- **Send images and files to T3 jobs** ([#41](https://github.com/boundsj/t3-fleet-gateway/pull/41)). `work_start` and `work_continue` accept base64 attachments, uploaded to the authorized destination T3 host and delivered with the instruction through T3's native attachment APIs. Limits are 8 files, 5 MiB each and 10 MiB total, with MIME/filename allowlists and image signature checks; URLs are unsupported. Queued bytes stay separate from job views and are cleared after launch or cancellation. Provider/model support varies. Attachment follow-ups have no downstream retry key: uncertain sends stay blocked for that request ID across restarts to prevent duplicate turns. Inspect the thread before submitting new work. See [Sending images and files](docs/attachments.md) for storage, retention and retry details.
 
 ### Fixed
 
-- T3's JSON-RPC refusals (invalid arguments, unknown tool) are reported as `t3_tool_failed` with `invalid_params` or `method_not_found` instead of a lost response that reset the T3 session.
-- A job that is already `idle` on a run that failed stays `idle` when it is next checked (a thread taken over after its run failed would otherwise fail at once).
+- **Keep worker turn failures recoverable** ([#40](https://github.com/boundsj/t3-fleet-gateway/pull/40)). A failed worker turn now leaves a launched job `idle` with `lastError.code: t3_run_failed`, so the watcher keeps following it and `work_continue` can resume it. Later activity clears the error and records `job_recovered`; dashboard attention, status, feed and settlement follow the same model. Failure webhooks keep type `failed` but report state `idle`. Launch failures, missing threads, cancellation and release remain terminal. Migration 16 reclassifies eligible old jobs without relaunching, resending or emitting a notification.
+
+## 0.2.0 (2026-10-22)
+
+### Upgrading
+
+- **Node first.** This build needs Node 24.22.1 or a later 24.x, or Node 26.12.1 or newer. Upgrade Node on the gateway machine before you deploy it: on an older Node the launcher refuses to start, so the service stays down until Node is upgraded (see Security below).
+- **Database migrations 14 and 15, forward only.** Migration 14 adds where each job came from (`origin`: `gateway`, `standing` or `adopted`, with the adopting client and time), per-client thread opt-ins, and append-only audit tables for scope changes and client thread actions. Migration 15 changes no data; it is a version barrier for paired host/project webhook targets. After either one, 0.1.x builds refuse the ledger. Stop older gateway processes and back up the data directory before the first start of 0.2.0. Running any command of this build against the data directory (`doctor`, `jobs list`, …) migrates it. **Rolling back to 0.1.x means restoring that backup**, and everything recorded since the upgrade is lost.
+- **New thread scopes are off for every existing client.** `threads:read` (find and read threads opened directly in T3) and `threads:control` (adopt and control them) are never granted automatically, and the approval page does not offer them. An operator grants them per client: `t3-fleet-gateway clients grant <clientId> --scope threads:read --scope threads:control`, checks with `clients scopes <clientId>` and removes them with `clients ungrant <clientId> --scope …`. A change applies on the client's next request with its existing token: no new token, connector change or restart. Both scopes come on top of the client's host Read/Operate grant, never instead of it.
+- **New background traffic.** `serve` now checks every enrolled host with a read-only `t3_environment_read` about 2–3 seconds after startup and then every 5 minutes (`reachability.intervalMinutes`, 1 to 60). Catalogs are still read only on demand.
+- Everything else carries over: credentials, grants, tokens, jobs, webhook connections and their queues. Webhook connections need no re-registration.
+
+### Security
+
+- Node 24.22.1 or a later 24.x, or Node 26.12.1 or newer, is now required (`engines`: `^24.22.1 || >=26.12.1`). These releases ship [nodejs/node#66871](https://github.com/nodejs/node/pull/66871), which blocks the eight compromised eMudhra/emSign intermediate keys (CVE-2026-111943) inside Node's own TLS verification, for fetch/undici, HTTPS and TLS alike, with the bundled CA list and with `--use-system-ca`, and keeps every root. The launcher refuses to start on an older release (including 25.x and 26.0 to 26.12.0) with a message naming the minimums, and `deploy/launchd/install.sh` refuses to install with one. The gateway's own blocklist preload, added earlier in this cycle and never in a tagged release, is removed; `CERT_REVOKED` still counts as a webhook `tls_error`. CI runs on exactly 24.22.1 and 26.12.1. The opt-in live test (`test/tls-trust-live.test.ts`) now requires `CERT_REVOKED` from Node itself with nothing preloaded. See [docs/security.md](docs/security.md#compromised-emudhra-intermediates).
+
+### Added
+
+- **Find and adopt threads opened directly in T3.** `fleet_threads { host, projectId }` lists a project's T3 threads (title, state, last update, archive and settlement fields when T3 has them, and whether a gateway job already owns the thread), paged 50 at a time (up to 100), with a 30-second cache and the usual `catalog_limit` bound. `work_adopt { host, projectId, threadId, requestId }` turns one of them into a gateway job (`origin: adopted`) using only T3 reads; the existing status, feed, messages, continue, respond, settle and cancel tools then work on it. Adoption changes no model, runtime or workspace, holds no launch slot or folder reservation, and `jobs release <jobId>` ends it without touching T3. Threads the gateway already owns, standing jobs, archived threads and delegated child threads cannot be adopted. Both tools need discovery enabled on the host and the client's host grant, plus `threads:read` (and `threads:control` to adopt or control). Clients without `threads:read` do not see adopted jobs anywhere. Standing jobs keep working with host grants alone. The dashboard marks adopted jobs.
+- **`clients grant`, `clients ungrant` and `clients scopes`** turn the thread scopes on and off for one client and show its current ones. They are idempotent, audited (ids, action and time only), check every scope name before writing and refuse unknown clients.
+- **`work_settle({ jobId, requestId })`** lets clients with Operate access settle idle, cancelled, failed or released jobs after a fresh T3 status and delegated-work check. It uses the existing host credential, maps permission and busy refusals to typed errors, confirms settlement by reading it back and emits a `thread_settled` feed event. Durable request-id replay never re-sends settlement after an ambiguous outcome. `work_status` shows live `settled` / `settledAt` (null when unknown); `work_continue` on a settled idle job resumes it through T3.
+- **Settle from the dashboard.** Quiet jobs with a T3 thread get **Settle** (then **Confirm settle** or **Keep open**) on Overview attention cards and in Jobs. It goes through the same settlement as `work_settle`, clears the job's attention item and adds a **settled** badge while the job keeps its state and history; new activity on the job brings the attention back. It uses the dashboard's existing write guards (custom API header, exact Origin, fetch metadata, bounded JSON).
+- **Host problem cards on the dashboard.** A host can answer health checks while its model catalog or other calls fail. The dashboard now records catalog fetch failures, failed T3 calls, `work_start` resolution failures and dispatch failures per host (in memory, codes and fixed text only), shows them as Overview attention cards with first and last time and a count, and shows the last model-catalog result on Hosts. Each kind clears on the next success of the same kind, and stops raising attention after 24 hours without recurring.
+- **Background reachability checks**, described under Upgrading. Every T3 call that succeeds, or fails on transport or authentication, now also updates the host's reachability and its time.
+- **Webhook targets on any host.** The dashboard's webhook setup lists discovered projects from every enrolled host with discovery enabled, grouped by host, beside the configured aliases; a host that cannot be read is marked and the rest stay usable. Such a connection stores the exact host and project id pair, and matches alias jobs and `target: { host, projectId }` jobs for that pair only, never the same project id on another host. Configuration-managed subscriptions can use paired `targets` too.
+- **A privacy check for this public repository.** `npm run privacy:check`, now the last step of `npm run check`, scans tracked and new files for real-looking `*.ts.net` hosts, home-directory paths, private and tailnet IPs and credentials, and for the maintainer's own private list (`PRIVACY_DENYLIST`, or the gitignored `.privacy-denylist`). It prints only locations and categories, never the text that matched. `--file`, `--stdin` and `--commits <range>` scan release or PR text and commit messages. `.github/workflows/privacy.yml` re-checks a pull request's title, description and commits when they change, `.github/pull_request_template.md` adds a checklist, and `.githooks/pre-push` is an optional local guard. AGENTS.md "Privacy and publishing" lists what must never appear and the placeholders to use instead.
+
+### Changed
+
+- The webhook payload `link` is now built by the same code as every other thread link. Plain UUID and `mcp:<uuid>` thread ids give the same bytes as before; ids with literal percent signs or URI punctuation are now escaped, and an id the gateway cannot turn into a safe link gives `link: null`. `threadId` is unchanged.
+- `clients revoke` refuses `--scope` and points to `clients ungrant`; revoking a whole client works as before.
+- Docs, evidence and screenshots use generic host names and leave out deployment-specific details.
+
+### Fixed
+
+- `fleet_models` and an explicit `work_start` `modelSelection` failed on T3 builds that return compact model options (`{ id, values, default? }`). Compact string values are now read as choices and boolean values as toggles, full descriptors still work, and a malformed model or option is skipped on its own instead of failing the whole catalog.
+- `fleet_threads` and `work_adopt` refused valid T3 thread ids that contain colons or percent escapes (such as `mcp:<uuid>`), so a refresh kept failing. Such ids are now accepted and linked correctly. A thread that shows up twice because T3's offset pages moved underneath the scan is listed once, and malformed rows are skipped with a count-only warning.
+- After a gateway restart the dashboard could show a host as **Not checked** even though calls to it were succeeding.
+- The webhook setup offered only configured aliases, so projects on other enrolled hosts could not be chosen.
+
+## 0.1.14 (2026-10-20)
+
+### Fixed
+
+- A merged pull request could raise no `pull_request_merged` event, and later polls never reported it. 0.1.13 kept at most 20 PRs per job and treated a snapshot of 20 as a window. A PR that opened and merged between two polls could not outrank a window of open PRs and was ignored, and a followed PR that merged on a thread with 21 or more open PRs was cut from the snapshot before it was compared. A job now follows up to 200 PRs (beyond that, open ones first, then the newest) and compares the lists in full: a PR whose state became open or merged raises its event, and so does a PR the previous list did not hold. Only a list at the 200-PR bound is treated as a window, where a PR that merely re-enters because another left still raises nothing.
+- Everything shown or sent still carries at most 20 PRs, open ones first and then the newest, listed in that order: `work_status`, `work_list`, `work_feed` and the other job views, their text summaries, PR webhook payloads (which stay inside the 16 KiB bound for ordinary links, however many PRs the job follows) and the dashboard. When a job follows more, the text says `20 of 35 shown` (`20 of 200+ shown` at the bound), and the PR an event is about may not be among those shown.
+- A PR URL must have the lowercase `/pull/` segment and a number without leading zeros. 0.1.13 compared the whole path without regard to case and accepted `https://github.com/owner/repo/PULL/23`, which GitHub answers with 404. Owner, repository and host are still compared without regard to case, and the URL is stored and shown exactly as T3 gave it.
+
+### Compatibility
+
+- No migration, configuration or tool-shape change. `jobs.pull_requests` is the same column and now holds up to 200 PRs (about 26 KB for 200 typical links); the job views keep their fields and their 20-PR bound. Rolling back to 0.1.13 reads a longer stored list back as its 20-PR window.
+- Snapshots stored by 0.1.13 held at most 20 PRs. On the first read after the upgrade, a thread that links more than 20 PRs shows its extra PRs as new to the job, so that job may raise one `pull_request_opened` and one `pull_request_merged` once. Threads with 20 or fewer PRs raise nothing.
+- Known limit: a job whose list holds exactly 200 PRs is treated as having more, so a PR that opens and merges between two polls while older PRs are unlinked can go unreported there ([design](docs/design.md#job-pull-request-snapshots)).
+
+## 0.1.13 (2026-10-20)
+
+### Fixed
+
+- Job pull requests were missing for repositories with capital letters and for threads that linked more than 20 PRs, with nothing logged. T3 lists `repository` in lower case while the PR URL keeps GitHub's casing, so the URL check rejected every PR of such a repository, and one rejected entry (or a 21st) discarded the whole list, leaving the job without a snapshot or frozen at its last one. The URL's path and host are now matched without regard to case, and the URL is stored and shown exactly as T3 gave it; every other check (https only, matching host, no port, credentials, query or fragment) is unchanged. T3's list is read entry by entry: an invalid entry is skipped, a repeat of a PR counts once, a list with entries but none valid is unknown (the last snapshot stays), and an empty list is none. The `list_thread_pull_requests` call itself no longer fails on a long list or an odd entry.
+- A snapshot holds at most 20 PRs: every open PR first, then the newest (highest number). `work_status` and `work_list` say so when they show 20 and older ones may be left out. A PR that leaves or re-enters a full snapshot raises no `pull_request_opened` or `pull_request_merged` event by itself.
+
+### Compatibility
+
+- No migration, configuration or tool-shape change, and stored snapshots read back unchanged. Jobs whose snapshot was never readable and is still unknown (existing and adopted jobs) get a silent baseline on their first good read; a job launched on 0.1.12 whose lists were always rejected still holds its initial empty snapshot and reports its PRs once then (at most one `pull_request_opened` and one `pull_request_merged`).
+
+## 0.1.12 (2026-10-20)
+
+- Follow T3-linked pull requests through cached `work_status`/`work_list` responses, with links, states and freshness for text-only clients.
+- Show PR number/state badges on dashboard jobs.
+- Add opt-in PR opened/merged feed and webhook events, atomically captured with snapshots and preserved across restart. Existing webhook defaults stay unchanged.
+- Keep optional PR lookup failures separate from host health; bound reads and retain last good data. Migration 13 adds nullable PR cache columns. No live hosted-client qualification is claimed.
+
+
+## 0.1.11 (2026-10-20)
+
+### Added
+
+- Optional automatic workspace selection for named projects, per host: `hosts[].workspaceProbeCommand` is an exact argv (no shell) that inspects a project's folder, given one JSON object on stdin ([Workspace probe](docs/configuration.md#workspace-probe), reference script `scripts/workspace-probe.js`). On such a host a repository root gets a fresh worktree from the freshly fetched remote base (`startFromOrigin: true`, on the alias's or discovery policy's `baseRef`), and any other folder runs in the folder itself (T3's `root` strategy, no branch). `work_start` takes an optional `workspace` (`{ "type": "auto" }`, `{ "type": "root" }`, `{ "type": "worktree", "baseRef"?, "startFromOrigin"? }`); on a host without a probe, or for a scratch alias, it is refused with `invalid_argument` and nothing is created. The choice is made when the job launches: acceptance reads nothing from T3 or the host, so alias-only starts keep their request-id hash and queue while the host is down. Contributor work from PR 16, reworked.
+- Root reservations: jobs in a project's own folder (`workspaceMode: "root"`) are serialized per host and identical canonical folder path, whatever aliases or T3 projects name that path. Nested paths (a repository root and a subdirectory of it) are not related. The ledger holds the reservation (migration 12, partial unique index), so it survives restarts and races between dispatch, `work_continue` and `work_respond`. It is held while the job is `dispatching`, `running`, `needs_input`, `cancel_requested` or `unknown` and while an idle coordinator's delegated work still runs; released when the job is idle with nothing delegated, or finished, once no unresolved resume attempt remains. Waiting jobs stay `queued` with `lastError.code` `workspace_root_busy` and take neither a slot nor the places of jobs behind them; resuming an idle job while another holds the folder is `workspace_root_busy` and sends nothing. Each follow-up or answer to an idle root job is an attempt with its own ledger-held ownership token, and every attempt restarts the ten-minute grace period: a definite failure gives back only its own claim (the folder is freed when no attempt is in flight and none ended unknown), a successful call settles only its own deduplicated operation, and an unknown outcome keeps its token across restarts until that operation resolves or the grace period ends at rest. State changes never settle sibling calls still awaiting an answer. Work started in T3 itself and standing jobs are outside it (recorded as a `workspace_root_contended` event); it is not a global lock.
+- `workspaceMode: "root"` in job views, `choosesWorkspace` on `fleet_status` hosts, a root and a `startFromOrigin` sample in the compatibility check.
+- Version 3 launch specs, and migration 12: the workspace, root reservation, resume attempt token and probe retry columns on `jobs`. Migration 12 is also the schema-version barrier for version 3 specs: older builds refuse the ledger. Stop older processes and back up the data directory before the first start of this build.
+
+### Fixed
+
+- A probe that fails, times out or returns bad output fails or delays only its own job. Jobs behind it dispatch in the same tick (also with one free slot); a probe that cannot reach its host (timeout, exit 255) gets three attempts for that job; a T3 host failure still backs the host off. Stopping the gateway kills a running probe.
+
+### Compatibility
+
+- Existing configurations are valid unchanged. Without `workspaceProbeCommand` nothing changes: worktrees from the local `baseRef`, legacy request-id hashes, no downstream call before dispatch. Queued jobs with version 1 or 2 specs keep their meaning on any host.
+- Covered by `test/workspace.test.ts` (public MCP and engine, synthetic probe, a reference-script check with real Git), a populated 11 to 12 migration in `test/storage.test.ts` and a config case. The field `workspaceRoot` in T3's project list is not confirmed against a live T3, and no live root launch is claimed.
+
+## 0.1.10 (2026-10-20)
+
+### Added
+
+- Work with no named project, per machine. A host can name a scratch alias as its `defaultProject`; `work_start` with `target: { host }` then starts the job in that alias, in T3's internal scratch workspace (shown as "No project" in T3) with no git worktree or branch. The host needs no discovery for this (an explicit `projectId` and a model selection do); `discovery.allowWorkStart` still governs only T3 projects without an alias. Agents are told to use a host-only target when the user names no project, and never to fall back to scratch for a named project they cannot resolve. [Configuration](docs/configuration.md#no-named-project).
+- `projects[].workspaceMode`: `worktree` (the default, unchanged) or `scratch`. A scratch launch sends `t3_thread_launch` with `scratch: true` and neither a project id nor a workspace strategy, so T3 files the thread under its own scratch project and gives it a folder of its own. The alias needs an explicit `t3ProjectId` pin, which must be that scratch project's id: the gateway validates it against the host's projects before each launch and looks there for a launch whose response was lost, but cannot check what the project is. If T3 files a thread under another project than the pin, the job follows the thread and the gateway logs the fixed warning `job.scratch_project_mismatch` (job and host ids only). A scratch pin may not be shared with a worktree alias on the same host (`config_invalid`). A scratch alias keeps every rule of an alias (`allowWorkStart`, `runtimeMode`, model defaults, per-host grants). Naming it with `project`, or using the host-only target, works without discovery and is recorded from the configuration without reading T3, so the job queues while the host is down and no T3 project name is recorded (`projectName` is null). An explicit model selection (validated against the fresh catalog at creation and at dispatch) and an explicit `projectId` need discovery; a target that names the pinned project is launched as that alias, scratch included.
+- `workspaceMode` in job views (null for an adopted standing thread), `fleet_status` projects and `fleet_projects`; `defaultProject` in `fleet_status` hosts. A scratch job's `branch` is empty, and its launch footer says it runs in T3's internal scratch workspace.
+- A scratch launch records a version 2 launch spec (scratch only): host, pin, alias, runtime mode and model, and the host-default binding when the default chose the alias. The dispatcher reads the host's projects and checks it again right before launching, and fails the job without launching if the alias, its pinned project, workspace mode, runtime mode or `allowWorkStart`, the host's default, or the host's `access` ceiling changed while it was queued (`launch_policy_changed`; `project_not_configured` when the alias was removed, `project_not_found` when the T3 project is gone). Version 1 specs keep their meaning, and a scratch job's lost launch response stays `unknown` and reconciles on the recorded project.
+- The developer compatibility check (`npm run compat:check`) also validates a launch with `scratch: true`, the input a scratch alias sends, against T3's advertised `t3_thread_launch` schema.
+- Migration 11, a schema-version barrier that changes no data and no table, numbered after the webhook migrations 9 and 10. It makes builds that do not know version 2 launch specs refuse the ledger, instead of reading a scratch spec as none and launching it in a worktree.
+
+### Fixed
+
+- A stored launch spec this build cannot read (damaged, or written by a build that knows more) used to be read as no spec, so its job was dispatched as an alias job from the configuration: a scratch job, or one started with a model selection, as a plain worktree job. It is now flagged on the job (`launchSpecUnreadable`) and never launched, and no read fails with it, so one bad row cannot stop the dispatcher, the watcher, `work_list` or the dashboard for its host. A queued job in that state fails with `database_error` and the message "This job's stored launch plan could not be read. Start the work again." through a normal guarded transition (it is in the feed, and in matching webhooks), and the jobs behind it still dispatch in the same tick. A job that already has a thread is followed as usual. Job views leave out what only the spec said: `projectName` and `model` are null, and `workspaceMode` is null (unknown, not a worktree). The first read of such a job in a process logs `job.launch_spec_unreadable` with ids only.
+- Stored jobs are read with the caller's host scope applied in SQL, so a job on a host the caller cannot read is reported exactly as an unknown job, whatever its launch spec holds. A repeated `work_start` request id is authorized against the stored job's host and answered from the ledger before the current alias is resolved: a replay survives the alias being renamed, moved or removed and asks T3 nothing; a replay without Operate on the job's host is `insufficient_scope`, with or without changed input, and the same check runs again inside the creation transaction.
+
+### Compatibility
+
+- Existing configurations are valid unchanged: aliases default to `workspaceMode: "worktree"`, and `defaultProject` is unset. Existing worktree aliases keep their request-id hashes and their downstream-free queueing, and so do scratch aliases and the host-only target.
+- Upgrading moves the ledger from schema version 10 to 11. Stop older processes first and back up the data directory: a build that stops at version 10 refuses the new ledger, so going back means restoring the backup. Running any command of the new build against the live data directory migrates it.
+- Covered by synthetic tests: `test/projectless.test.ts` (launch shape, a host that is down, replays, policy drift, authorization order, lost responses, restarts, configuration), scratch cases in `test/host-scopes.test.ts`, `test/webhooks.test.ts`, `test/dashboard.test.ts`, `test/fleet-status.test.ts` and `test/discovery.test.ts`, and a populated version 10 to 11 migration in `test/storage.test.ts`. No live T3 run of a scratch launch is claimed.
 
 ## 0.1.9 (2026-10-17)
 
@@ -33,7 +180,7 @@
 
 - The dashboard's private network boundary now permits webhook destination management. It remains separate from the MCP/OAuth listener; job, host and client controls are unchanged. Management requests require JSON, the custom API header, an exact request-host Origin and same-origin fetch metadata when present. Errors and audit records contain fixed codes only; no saved URL, header, response body or credential is exposed, and the browser stores no secrets.
 - Connection creation and replacement use the same bounded TLS-validating POST transport as delivery. A failed test preserves the existing route. Successful changes recheck the revision after the awaited test and cancel pending old-route payloads; disconnect cannot be undone by a slow test. Writes are refused before readiness and after shutdown begins; shutdown aborts and drains management pings before closing SQLite.
-- No live Grok receiver or production deployment qualification is claimed by this implementation's synthetic tests.
+- No live Grok receiver or deployment qualification is claimed by this implementation's synthetic tests.
 
 ## 0.1.8 (2026-10-16)
 
@@ -59,7 +206,7 @@
 
 ### Fixed
 
-- The configured non-mutating `mintPairingCodeProbe` has a ten-second deadline instead of two. The deployed macOS service runs as a launchd agent with `ProcessType` Background, which schedules its children at a lower priority: the configured T3 version probe, which answers in about half a second in the foreground, was measured at just over two seconds there, so startup logged `probe_timeout` while foreground `doctor` passed ([evidence](docs/evidence/startup-probe.md)). Output budgets, the exact configured argv, executable resolution, startup independence, abort on shutdown and the non-mutating-only rule are unchanged; a hung probe can now hold the first renewal pass or a `doctor` host check for up to ten seconds. No launchd template or configuration change.
+- The configured non-mutating `mintPairingCodeProbe` has a ten-second deadline instead of two. A macOS service run as a launchd agent with `ProcessType` Background has its children scheduled at a lower priority: the configured T3 version probe, which answers in well under a second in the foreground, took over two seconds there on a test machine, so startup logged `probe_timeout` while foreground `doctor` passed ([evidence](docs/evidence/startup-probe.md)). Output budgets, the exact configured argv, executable resolution, startup independence, abort on shutdown and the non-mutating-only rule are unchanged; a hung probe can now hold the first renewal pass or a `doctor` host check for up to ten seconds. No launchd template or configuration change.
 
 ### Added
 
@@ -71,7 +218,7 @@
 ### Compatibility
 
 - No change for existing configurations: discovery is off unless `hosts[].discovery.enabled` is set, and the host must separately set `discovery.allowWorkStart` before any launch into an unconfigured project. Existing grants, aliases, defaults, request ids and queued jobs behave as before. Migration 8 adds one nullable column.
-- Covered by synthetic two-host tests (`test/discovery.test.ts`): opt-out, same-named projects on two hosts, restricted and read-only grants, an unavailable host, browse-only hosts, alias bypass attempts, selections and defaults, idempotency, restart, pre-dispatch failures, lost launches, paging, cache, cursor identity across a restart, strict selection input, title renames after browsing and privacy. A bounded isolated smoke against one fresh QA-only T3 instance passed 28 of 28 checks at both the initial head and the implementation with review fixes ([docs/evidence/discovery.md](docs/evidence/discovery.md)). That is not a live fleet, production or hosted-connector (Grok, Notion) qualification.
+- Covered by synthetic two-host tests (`test/discovery.test.ts`): opt-out, same-named projects on two hosts, restricted and read-only grants, an unavailable host, browse-only hosts, alias bypass attempts, selections and defaults, idempotency, restart, pre-dispatch failures, lost launches, paging, cache, cursor identity across a restart, strict selection input, title renames after browsing and privacy. A bounded isolated smoke against one fresh QA-only T3 instance passed 28 of 28 checks at both the initial head and the implementation with review fixes ([docs/evidence/discovery.md](docs/evidence/discovery.md)). That is not a live fleet or hosted-connector (Grok, Notion) qualification.
 
 ## 0.1.6 (2026-10-15)
 
@@ -86,7 +233,7 @@ No database migration or configuration change.
 
 ### Added
 
-- Per-machine authorization. The approval page offers All machines (the fleet scopes: every host, including hosts added later) or Selected machines (`host:<id>:read` / `host:<id>:operate` for the ticked hosts only), and `clients token --hosts mini,macbook` (or `--hosts all`, the default) does the same for bearer tokens. Every tool enforces the hosts: `fleet_status`, `work_list`, `work_feed` events and attention show only permitted hosts (filtered before limits); direct job tools answer a job elsewhere as an unknown id, and `work_start` checks both the project's host and the host of a replayed request's job. Empty, malformed or unknown selections are refused before an approval code is spent or a token is stored. A refused approval page, including after a wrong approval code, is shown again with the machines and access the operator chose, never the request's defaults.
+- Per-machine authorization. The approval page offers All machines (the fleet scopes: every host, including hosts added later) or Selected machines (`host:<id>:read` / `host:<id>:operate` for the ticked hosts only), and `clients token --hosts main,studio` (or `--hosts all`, the default) does the same for bearer tokens. Every tool enforces the hosts: `fleet_status`, `work_list`, `work_feed` events and attention show only permitted hosts (filtered before limits); direct job tools answer a job elsewhere as an unknown id, and `work_start` checks both the project's host and the host of a replayed request's job. Empty, malformed or unknown selections are refused before an approval code is spent or a token is stored. A refused approval page, including after a wrong approval code, is shown again with the machines and access the operator chose, never the request's defaults.
 - `clients list` and `clients diagnose` show granted access per host.
 
 ### Compatibility
@@ -100,14 +247,14 @@ Covered by synthetic two-host tests through the public OAuth, MCP and CLI interf
 
 ### Fixed
 
-- T3FG-11, found during T3FG-3 supervised live QA: accept T3-owned opaque pending request IDs unchanged in `work_respond` and targeted `work_status`. Real Codex IDs exceed the previous 200-character limit. Job/request membership, non-empty validation and the separate question-id, answer-size and idempotency-key limits remain enforced. Public text-only regressions reproduce both failures before the fix; the original real question resumes successfully after it.
+- Found in live testing: accept T3-owned opaque pending request IDs unchanged in `work_respond` and targeted `work_status`. Real Codex IDs exceed the previous 200-character limit. Job/request membership, non-empty validation and the separate question-id, answer-size and idempotency-key limits remain enforced. Public text-only regressions reproduce both failures before the fix; the original real question resumes successfully after it.
 
-- T3FG-12: a transient T3 `waiting` status with zero pending requests no longer invents a permission approval. Actual questions and positive pending counts still produce `needs_input`. The native sample predates this state-rule fix; its synthetic regression fails before the fix and passes after it, and real v0.1.4 question resumption after the fix showed no false approval. Subsequent operator approval retests completed on both isolated and production v0.1.4 gateways, with exact scratch markers and cleared approval flags.
+- A transient T3 `waiting` status with zero pending requests no longer invents a permission approval. Actual questions and positive pending counts still produce `needs_input`. The native sample predates this state-rule fix; its synthetic regression fails before the fix and passes after it, and real v0.1.4 question resumption after the fix showed no false approval. Operator permission-approval retests completed afterward, with exact scratch markers and cleared approval flags.
 
 ### Changed
 
 - Restore the prepared expanded opt-in lifecycle script: tool discovery, `work_list`, full `work_messages` reads and explicit successful-tool coverage. An explicit scratch project alias is required.
-- Document the supervised run from the v0.1.3 baseline through the fix builds and the authorized v0.1.4 deployment: lifecycle, isolated runtime failure, standing-job reuse, delegated child/parent resumption, SDK outage recovery and a lost start response. v0.1.4 question, lifecycle and operator approval retests passed; a direct HTTP client using only content text passed the isolated question/messages/feed check, and Grok Bot confirmed reading the production question/options as plain text and answering with the full 228-character request ID through its connector registered as Cursor. Owned QA jobs and temporary runtime/access were cleaned up; original production settings were restored and doctor passed. An actual Notion Custom Agent's existing MCP connection passed a production v0.1.3 fleet check; T3FG-3 is complete under the agreed shared-contract/connectivity scope. A separate Notion job workflow and hosted-client recovery remain optional, unrun coverage.
+- Document the verified behavior from live testing (lifecycle, isolated runtime failure, standing-job reuse, delegated child/parent resumption, SDK outage recovery and a lost start response) in docs/operations.md, "Verified behavior". v0.1.4 question, lifecycle and permission-approval retests passed; a direct HTTP client using only content text passed the isolated question/messages/feed check, and Grok Bot read a real question and its options as plain text and answered with the full request ID (over 200 characters). A separate Notion job workflow and hosted-client recovery remain unrun.
 
 All notable changes are recorded here. The project follows [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 
@@ -115,7 +262,7 @@ All notable changes are recorded here. The project follows [Semantic Versioning]
 
 ### Added
 
-- T3FG-5: offline `clients diagnose <id>` reports OAuth versus static bearer clients, usable access/refresh grants, expiry ranges, rotation/grace/supersession/replay states, and each family's revocation reason. Aggregate usability considers every family, while explicitly leaving operator/cloud route reachability and the connector's saved token unknown.
+- Offline `clients diagnose <id>` reports OAuth versus static bearer clients, usable access/refresh grants, expiry ranges, rotation/grace/supersession/replay states, and each family's revocation reason. Aggregate usability considers every family, while explicitly leaving operator/cloud route reachability and the connector's saved token unknown.
 - Separate successful MCP and refresh timestamps (append-only migration 7). Old mixed last-use data remains intact; new times start unknown. Completed authorized MCP HTTP 2xx exchanges are sampled once per minute; successful refresh pair issuance, including grace retries, is recorded transactionally on every success.
 - Synthetic SDK outage recovery regression: saved credentials and feed cursor survive ingress loss across access expiry, automatically refresh on reconnection, and resume without duplicate events or work. This recovery already passed on the pinned v0.1.2 implementation; the new diagnostic CLI was missing there.
 - Recovery instructions distinguish ingress, gateway authentication, downstream T3 credentials, and disabled connector routines. Installed SDK retry limits are documented; real Grok and Notion retry behavior remains unverified.
@@ -124,25 +271,25 @@ All notable changes are recorded here. The project follows [Semantic Versioning]
 
 - `clients list` labels OAuth families as `unrevoked` rather than inferring active authentication from their count; use `diagnose` for grant usability.
 
-T3FG-1 remains blocked on the monitoring decision. T3FG-3/full live QA remains deferred; no new live verification, deployment, or publishing is claimed.
+No new live verification, deployment, or publishing is claimed.
 
 ## 0.1.2 (2026-10-12)
 
 ### Fixed
 
-- T3FG-2: `work_status` text now includes pending request and question ids, headers, question text, every option label/description/value, selection rules and answer constraints. Clients that consume only MCP text can answer with `work_respond`. `allowCustomAnswer`, `required` and `multiSelect` preserve true/false, with null for null or absent T3 flags. Unreadable questions remain explicitly temporarily unreadable.
+- `work_status` text now includes pending request and question ids, headers, question text, every option label/description/value, selection rules and answer constraints. Clients that consume only MCP text can answer with `work_respond`. `allowCustomAnswer`, `required` and `multiSelect` preserve true/false, with null for null or absent T3 flags. Unreadable questions remain explicitly temporarily unreadable.
 - Pending questions are bounded without partial actionable data: at most five requests read by default; `pendingRequestId` selects another. A request exceeding 50 questions, 100 options per question or 64,000 JSON characters returns `questions: null` and `questionsUnavailable: "too_large"`, directing the operator to T3. `read_limit` and `temporarily_unreadable` explain other null results. `work_cancel` text points to `work_status` before answering a still-pending question.
 - Unspecified question flags retain honest nulls while text provides an answer path: follow explicit wording, and without instructions to select several try a single listed value as a conservative attempt. T3 validation remains authoritative; omitted/null flags alone do not require escalation.
 - Automatic renewal starts after all startup preflight checks settle, including an unexpected rejection, unless shutdown has begun. Rejections produce fixed diagnostics; logger errors still propagate and known executable failures still gate each host's renewal.
 - Probe cancellation explicitly force-kills the direct child, including probes that ignore SIGTERM on Node 26.0. Startup preflight never initiates or awaits health reads, so stalled MCP initialization cannot delay shutdown through preflight; doctor still compares fresh health.
-- T3FG-4: `doctor` and `serve` startup preflight the mint executable in their own process environment, diagnose missing/non-executable commands and version-pinned paths, and distinguish known failure from unverified checks. Known executable failures stop automatic renewal before pairing registration while retaining the old credential.
+- `doctor` and `serve` startup preflight the mint executable in their own process environment, diagnose missing/non-executable commands and version-pinned paths, and distinguish known failure from unverified checks. Known executable failures stop automatic renewal before pairing registration while retaining the old credential.
 
 ### Added
 
 - Optional `hosts[].mintPairingCodeProbe`: exact argv for an explicitly operator-configured non-mutating probe. No mint command or guessed `--version` is executed as preflight. Probes time out after two seconds, cap stdout/stderr at 4,096 bytes each, and are aborted on shutdown without being awaited. A bare version, exact native `t3 v<semver>` output or JSON `{"version":"x.y.z"}` enables comparison with the T3 server; disagreement is a warning, not an incompatibility verdict.
 - Synthetic public MCP and CLI regressions, question-limit/nullable-flag coverage, PATH/probe/startup/shutdown checks and logging/event leakage checks. Command diagnostics contain no raw stdout/stderr, argv or executable paths; enrollment no longer echoes command argv.
 
-No database migration. This release covers T3FG-2 and T3FG-4 only. T3FG-1 remains blocked on the monitoring decision; T3FG-3/full live QA remains deferred until the operator is available. No new live QA is claimed.
+No database migration. No new live QA is claimed.
 
 ## 0.1.1 (2026-10-09)
 
@@ -190,7 +337,7 @@ No database migration. This release covers T3FG-2 and T3FG-4 only. T3FG-1 remain
 - Delegated work (`waitingOnDelegatedWork`, `delegatedTasks`) was never detected against a real T3: the watcher looked for `subagent` items in thread reads that named no view, and T3's default `messages` view returns only user and assistant messages and plans. The watcher now reads T3's `activity` view for delegated work, with a read position of its own (schema migration 4 adds `jobs.activity_position`) and one character per item, while replies, the excerpt and the job's state still come from the messages view, so a coordinator's reasoning and tool activity never delays them. Adoption starts the activity position at the thread's current end and finds delegated work still running with a bounded scan back from the last message; a standing job adopted before this update is scanned the same way on its first check. Every job, launched ones too, is checked for delegated work. Every thread read now names its view, and the test fake models both views.
 - A pending item in a thread's timeline (a command still running, or a coordinator's delegated work, which stays pending for as long as the child works) held the watcher's read position back and hid every later message from the excerpt. Only a worker message still being written holds the position now, and the excerpt is the newest settled worker message read.
 - Migration 2 failed on a version 1 database created by an early build of migration 1 (no `state_changed_at` or `t3_thread_link`, or a text `read_position`). It now copies the columns the table actually has, fills `state_changed_at` from `updated_at`, leaves `t3_thread_link` empty and converts `read_position` to an integer (empty when it is not a number). A failed migration, including a database locked by another process (`SQLITE_BUSY`), is now reported as `database_error` naming the migration, instead of a raw SQLite error.
-- Approving in Chrome could leave the operator on the approval page: the form answered with a redirect to the client's callback, and Chrome applies the page's `form-action` to every redirect after a submission, so a callback that redirected on to another origin (as Cursor's does for Grok Bot) was blocked silently. Pressing Approve again then failed with "approval code was not accepted". The form now answers with a small page that navigates to the callback (meta refresh, plus a Continue link), for approvals, denials and request errors alike; `form-action` is `'self'` only. Submitting an approved form again shows the same authorization response while its code is unused and unexpired (no new code, no approval code spent, no failed attempt counted), and afterwards says the request was already approved.
+- Approving in Chrome could leave the operator on the approval page: the form answered with a redirect to the client's callback, and Chrome applies the page's `form-action` to every redirect after a submission, so a callback that redirected on to another origin (as hosted clients' callbacks can) was blocked silently. Pressing Approve again then failed with "approval code was not accepted". The form now answers with a small page that navigates to the callback (meta refresh, plus a Continue link), for approvals, denials and request errors alike; `form-action` is `'self'` only. Submitting an approved form again shows the same authorization response while its code is unused and unexpired (no new code, no approval code spent, no failed attempt counted), and afterwards says the request was already approved.
 - The CLI crashed with an unhandled `EPIPE` when its reader closed early (`t3-fleet-gateway pair | head -1`). Output to a closed pipe is now dropped and the command finishes with its own exit code; other stdout and stderr errors still fail it.
 - `deploy/launchd/install.sh` could leave the service unloaded when reinstalling: `launchctl bootout` returns before launchd has removed the agent, and the immediate `bootstrap` failed with `Bootstrap failed: 5: Input/output error`. The installer now waits (up to 10 seconds) until the agent is gone and retries the bootstrap once; `--uninstall` waits too.
 - The CLI silently ignored `--title`, `--all` and `--ttl` on commands that do not take them; they are now usage errors (exit 2) outside `jobs adopt`, `jobs list` and `pair` respectively.

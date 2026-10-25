@@ -326,9 +326,101 @@ ALTER TABLE webhook_subscriptions ADD COLUMN last_test_status_code INTEGER;
   {
     version: 13,
     name: 'agent-adopted jobs',
-    // adopted: 1 for a job an agent took over with work_adopt (an existing T3 thread, never launched, standing = 0);
-    // 0 for launched and standing jobs, and for every job before this.
+    // adopted: 1 for a job an agent took over with the fork's work_adopt (an existing T3 thread, never launched, standing = 0);
+    // 0 for launched and standing jobs, and for every job before this. Published on this fork's main before upstream's
+    // migrations 12-17 existed, so it is not rewritten. Migration 16 copies adopted = 1 into origin = 'adopted'.
+    // Current code uses origin; this column stays for ledgers that already applied version 13.
     sql: 'ALTER TABLE jobs ADD COLUMN adopted INTEGER NOT NULL DEFAULT 0 CHECK (adopted IN (0, 1));',
+  },
+  {
+    version: 14,
+    name: 'workspace root reservations',
+    // Upstream v0.1.11 migration 12, appended here. Versions 12 and 13 were already published on this fork
+    // (12 is a no-op barrier; 13 is jobs.adopted), so a deployed ledger at version 13 must not be asked to
+    // re-run those numbers. launch_spec may hold a version 3 record (a workspace decided at dispatch).
+    // The new columns hold only what the dispatcher resolves: workspace_kind ('root' or 'worktree'; NULL when
+    // unresolved) and workspace_root_key (a hash of host and canonical folder, set for root jobs).
+    // workspace_root_held_at is the ledger reservation. workspace_resume_tokens names follow-ups and answers
+    // begun on an idle root job. The probe columns bound retries when a probe could not reach its host.
+    sql: `
+ALTER TABLE jobs ADD COLUMN workspace_kind TEXT CHECK (workspace_kind IN ('root', 'worktree'));
+ALTER TABLE jobs ADD COLUMN workspace_root_key TEXT;
+ALTER TABLE jobs ADD COLUMN workspace_root_held_at INTEGER;
+ALTER TABLE jobs ADD COLUMN workspace_resume_tokens TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE jobs ADD COLUMN probe_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN probe_retry_at INTEGER;
+CREATE INDEX jobs_workspace_root ON jobs(host_id, workspace_root_key) WHERE workspace_root_key IS NOT NULL;
+CREATE UNIQUE INDEX jobs_workspace_root_held ON jobs(host_id, workspace_root_key) WHERE workspace_root_held_at IS NOT NULL;
+`,
+  },
+  {
+    version: 15,
+    name: 'job pull request snapshots',
+    // Upstream migration 13.
+    sql: `ALTER TABLE jobs ADD COLUMN pull_requests TEXT;
+ALTER TABLE jobs ADD COLUMN pull_requests_checked_at INTEGER;`,
+  },
+  {
+    version: 16,
+    name: 'external thread adoption and client opt-in scopes',
+    // Upstream migration 14, plus a backfill of this fork's jobs.adopted rows into origin = 'adopted'.
+    sql: `ALTER TABLE jobs ADD COLUMN origin TEXT NOT NULL DEFAULT 'gateway' CHECK (origin IN ('gateway', 'standing', 'adopted'));
+UPDATE jobs SET origin = 'standing' WHERE standing = 1;
+ALTER TABLE jobs ADD COLUMN adopted_by TEXT;
+ALTER TABLE jobs ADD COLUMN adopted_at INTEGER;
+UPDATE jobs SET adopted_by = 'operator', adopted_at = created_at WHERE standing = 1;
+UPDATE jobs SET origin = 'adopted', adopted_by = client_id, adopted_at = created_at WHERE adopted = 1 AND standing = 0;
+CREATE INDEX jobs_host_thread ON jobs(host_id, t3_thread_id);
+CREATE TABLE client_thread_scopes (
+  client_id TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
+  scope TEXT NOT NULL CHECK (scope IN ('threads:read', 'threads:control')),
+  PRIMARY KEY (client_id, scope)
+) STRICT;
+CREATE TABLE operator_scope_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  client_id TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('grant', 'revoke')),
+  scope TEXT NOT NULL,
+  changed INTEGER NOT NULL CHECK (changed IN (0, 1)),
+  created_at INTEGER NOT NULL
+) STRICT;
+CREATE TRIGGER operator_scope_events_no_update BEFORE UPDATE ON operator_scope_events BEGIN SELECT RAISE(ABORT, 'scope events are append-only'); END;
+CREATE TRIGGER operator_scope_events_no_delete BEFORE DELETE ON operator_scope_events BEGIN SELECT RAISE(ABORT, 'scope events are append-only'); END;
+CREATE TABLE thread_action_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  client_id TEXT NOT NULL,
+  host_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+) STRICT;
+CREATE TRIGGER thread_action_events_no_update BEFORE UPDATE ON thread_action_events BEGIN SELECT RAISE(ABORT, 'thread actions are append-only'); END;
+CREATE TRIGGER thread_action_events_no_delete BEFORE DELETE ON thread_action_events BEGIN SELECT RAISE(ABORT, 'thread actions are append-only'); END;`,
+  },
+  {
+    version: 17,
+    name: 'host and project webhook targets',
+    // Upstream migration 15. Settings gain optional paired targets. Existing alias filters, routes, revisions and queues stay intact.
+    // The version barrier prevents an older sender from ignoring the new filter and broadcasting it.
+    sql: 'SELECT 1;',
+  },
+  {
+    version: 18,
+    name: 'recoverable worker turn failures',
+    // Upstream migration 16. Reclassify the old representation. Preserve errors, timestamps,
+    // settlement acknowledgments and immutable outbox payloads. Older builds refuse this ledger.
+    sql: `UPDATE jobs SET state = 'idle', finished_at = NULL
+      WHERE state = 'failed' AND last_error_code = 't3_run_failed' AND t3_thread_id IS NOT NULL;`,
+  },
+  {
+    version: 19,
+    name: 'queued launch attachments',
+    // Upstream migration 17.
+    sql: `CREATE TABLE job_launch_attachments (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+  payload TEXT NOT NULL
+) STRICT;`,
   },
 ];
 

@@ -47,6 +47,7 @@ const JOB_ERRORS: Record<string, string> = {
   launch_policy_changed: 'The project\'s launch policy changed while the job was queued, so it was not launched.',
   project_not_configured: 'The job\'s project alias is no longer in the configuration.',
   project_not_found: 'The job\'s T3 project no longer exists.',
+  database_error: 'The job\'s stored launch plan could not be read, so it was not launched. Start the work again.',
   host_unreachable: 'The host could not be reached while following this job; it keeps its state.',
   t3_invalid_response: 'T3 answered in an unexpected shape while following this job.',
 };
@@ -82,6 +83,7 @@ export const EVENT_REASONS: Record<string, string> = {
   launch_not_confirmed: 'launch not confirmed',
   thread_already_followed: 'thread already followed by another job',
   run_failed: 'run failed',
+  worker_resumed: 'recovered after a failed turn',
   released: 'released by the operator',
   turn_started: 'started a turn by itself',
   waiting_on_delegated_work: 'waiting on delegated work',
@@ -98,10 +100,13 @@ export const EVENT_REASONS: Record<string, string> = {
 
 const EVENT_TYPES: Record<string, string> = {
   created: 'Created',
+  job_recovered: 'Worker recovered',
   followup_sent: 'Follow-up delivered',
   input_answered: 'Question answered',
   turn_finished: 'Ran a turn by itself',
   delegated_work_ended: 'Delegated work ended',
+  pull_request_opened: 'Pull request opened',
+  pull_request_merged: 'Pull request merged',
   interrupt_requested: 'Interrupt requested',
 };
 

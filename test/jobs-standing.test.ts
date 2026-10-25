@@ -6,7 +6,7 @@ import { runCli } from '../src/cli/main.ts';
 import { openDataDir } from '../src/dataDir.ts';
 import { openDatabase } from '../src/db/database.ts';
 import { OPEN_STATES } from '../src/jobs/states.ts';
-import { JobStore, type NewAdoptedJob } from '../src/jobs/store.ts';
+import { JobStore, type NewStandingJob } from '../src/jobs/store.ts';
 import { silentLogger } from '../src/log.ts';
 import { MINUTE } from '../src/time.ts';
 import type { FakeT3 } from './helpers/fakeT3.ts';
@@ -68,7 +68,7 @@ function cliLedger(t: TestContext, harness: JobHarness): JobStore {
 }
 
 /** The standing job `jobs adopt` records for a running thread. */
-function standingJob(fake: FakeT3, threadId: string): NewAdoptedJob {
+function standingJob(fake: FakeT3, threadId: string): NewStandingJob {
   const thread = fake.threads.get(threadId)!;
   return {
     id: 'synthcli01', projectAlias: 'pilot', hostId: 'main', t3ProjectId: thread.projectId, state: 'running', title: thread.title,
@@ -595,8 +595,9 @@ describe('standing jobs: delegated work in the activity view', () => {
       [
         ['messages', 3, 100, 2000],
         ...[3, 103, 203, 303, 403, 503, 603].map((after) => ['activity', after, 100, 1]),
+        ['messages', null, 1, 1], // work_status reads live settlement metadata without message content.
       ],
-      'one messages read for the reply; the activity in pages of 100 items of one character',
+      'one messages read for the reply, paged activity, and a status-only read for settlement',
     );
 
     // A quiet check: one read of each view, and the followed item re-read by position.

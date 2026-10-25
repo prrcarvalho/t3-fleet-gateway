@@ -10,6 +10,8 @@ export type ErrorCode =
   | 'host_not_enrolled'
   | 'host_unreachable'
   | 'workspace_probe_unavailable'
+  | 'workspace_probe_failed'
+  | 'workspace_root_busy'
   | 't3_unauthorized'
   | 't3_timeout'
   | 't3_response_lost'
@@ -23,9 +25,9 @@ export type ErrorCode =
   | 'start_disabled'
   | 'discovery_disabled'
   | 'catalog_limit'
-  | 'internal_error'
   | 'tool_not_allowed'
-  | 'native_reads_disabled';
+  | 'native_reads_disabled'
+  | 'internal_error';
 
 export class GatewayError extends Error {
   readonly code: ErrorCode;

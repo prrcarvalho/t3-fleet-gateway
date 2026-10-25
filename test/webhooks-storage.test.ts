@@ -12,6 +12,7 @@ import { webhooksSchema } from '../src/webhooks/config.ts';
 import { MAX_ATTEMPTS_PER_SUBSCRIPTION, MAX_PAYLOAD_BYTES, MAX_PENDING_PER_SUBSCRIPTION, MAX_SUBSCRIPTIONS,
   WebhookStore, type DashboardTest } from '../src/webhooks/store.ts';
 import { testClock } from './helpers/clock.ts';
+import { rowsWithoutV12 } from './helpers/migrations.ts';
 import { tempDir } from './helpers/tmp.ts';
 
 function fixture(t: TestContext) {
@@ -74,17 +75,12 @@ describe('webhook migration and durable store boundaries', () => {
         VALUES ('client-1', 'work_start', 'request-1', 'synthetic-request-hash', 'oldjob0001', 1);
     `);
     const tables = ['oauth_clients', 'token_families', 'refresh_tokens', 'access_tokens', 'host_credentials', 'jobs', 'job_events', 'idempotency_keys'];
-    const before = tables.map((table) => old.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all().map((row) => ({ ...row })));
+    const before = tables.map((table) => old.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all());
     old.close();
     const db = openDatabase(path);
     t.after(() => db.close());
     assert.equal(schemaVersion(db), SCHEMA_VERSION);
-    assert.deepEqual(tables.map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all().map((row) => {
-      // Migration 13 adds adopted (0) to every existing job.
-      const { adopted, ...rest } = { ...row } as Record<string, unknown>;
-      if (table === 'jobs') assert.equal(adopted, 0);
-      return table === 'jobs' ? rest : { ...row };
-    })), before);
+    assert.deepEqual(tables.map((table) => rowsWithoutV12(db, table)), before);
     for (const table of ['job_turns', 'webhook_subscriptions', 'webhook_deliveries', 'webhook_attempts']) {
       assert.deepEqual(db.prepare(`SELECT * FROM ${table}`).all(), [], `${table} begins empty`);
     }
@@ -170,7 +166,7 @@ describe('webhook migration and durable store boundaries', () => {
     f.jobs.transition(prior.id, { from: ['queued'], to: 'cancelled' });
     const connection = f.webhooks.connectDashboard('dashboard-one', 'pilot', 'main', dashboardRoute, successfulTest(f.clock()));
     assert.deepEqual(connection, {
-      id: 'dashboard-one', revision: connection.revision, source: 'dashboard', projects: ['pilot'], hosts: ['main'],
+      id: 'dashboard-one', revision: connection.revision, source: 'dashboard', projects: ['pilot'], hosts: ['main'], targets: [],
       lastTest: { at: new Date(f.clock()).toISOString(), outcome: 'delivered', statusCode: 204 },
     });
     const settings = JSON.parse(f.db.prepare("SELECT settings FROM webhook_subscriptions WHERE id = 'dashboard-one'").get()!.settings as string);
@@ -402,4 +398,55 @@ describe('webhook migration and durable store boundaries', () => {
     assert.equal(JSON.stringify(f.webhooks.diagnostics()).includes('synthetic-private-header'), false);
     assert.equal(JSON.stringify(f.webhooks.diagnostics()).includes('Synthetic private task'), false);
   });
+});
+
+test('migration 15 preserves populated v14 subscriptions, secrets, revisions, queues and diagnostics byte-for-byte', (t) => {
+  const path = join(tempDir(t), 'previous.db');
+  const db = new DatabaseSync(path);
+  t.after(() => db.close());
+  // Version 16 is the last schema change before the paired-target barrier (version 17 on this fork; upstream's 15).
+  migrate(db, MIGRATIONS.slice(0, 16));
+  const clock = testClock();
+  const webhooks = new WebhookStore(db, clock);
+  const jobs = new JobStore(db, clock, silentLogger);
+  const connection = webhooks.connectDashboard('existing-route', 'pilot', 'main', dashboardRoute, successfulTest(clock()));
+  // Disabled config entries have no active persisted row. Preserve a legacy settings object too.
+  db.prepare(`INSERT INTO webhook_subscriptions (id, revision, identity, settings, route, source)
+    VALUES ('legacy-file', 'synthetic-revision', 'synthetic-identity', ?, ?, 'config')`)
+    .run(JSON.stringify({ enabled: false, hosts: ['main'], projects: ['pilot'], events: ['cancelled'], excerptChars: 0 }), JSON.stringify(dashboardRoute));
+  const job = createJob(jobs);
+  // Seed the historical layout directly: the current transition also cleans the attachment table added later.
+  db.prepare("UPDATE jobs SET state = 'cancelled' WHERE id = ?").run(job.id);
+  jobs.appendEvent(job.id, 'state_changed', 'cancelled');
+  const tables = ['webhook_subscriptions', 'webhook_deliveries', 'webhook_attempts', 'job_events', 'jobs'];
+  const before = tables.map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all());
+  migrate(db);
+  assert.equal(schemaVersion(db), SCHEMA_VERSION);
+  assert.deepEqual(tables.map((table) => db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()), before);
+  assert.deepEqual(webhooks.route(connection.id, connection.revision), dashboardRoute);
+  assert.throws(() => migrate(db, MIGRATIONS.slice(0, 16)), /schema version 19 is newer/);
+  assert.equal(webhooks.claim(1, 30_000).length, 1, 'pending delivery still dispatches');
+});
+
+test('paired config targets never turn into a cross product of host and project filters', (t) => {
+  const f = fixture(t);
+  f.webhooks.reconcile(webhooksSchema.parse({ subscriptions: [{ ...f.config.subscriptions[0],
+    targets: [{ host: 'host-a', projectId: 'project-1' }, { host: 'host-b', projectId: 'project-2' }],
+  }] }), f.dir);
+  for (const host of ['host-a', 'host-b']) {
+    for (const projectId of ['project-1', 'project-2']) {
+      const id = `${host}-${projectId}`;
+      const job = f.jobs.create({ id, clientId: 'synthetic-client', requestId: id, inputHash: id,
+        projectAlias: 'synthetic-alias', hostId: host, t3ProjectId: projectId, task: 'Synthetic task', title: 'Synthetic title',
+        branch: '', runtimeMode: 'auto' }).job;
+      f.jobs.transition(job.id, { from: ['queued'], to: 'cancelled' });
+    }
+  }
+  const claims = f.webhooks.claim(4, 30_000);
+  // One in-flight request per subscription; settle it before claiming the next.
+  assert.equal(claims.length, 1);
+  f.webhooks.finish(claims[0]!, { outcome: 'delivered', statusCode: 200 });
+  const next = f.webhooks.claim(4, 30_000);
+  assert.equal(next.length, 1);
+  assert.deepEqual([...claims, ...next].map((c) => JSON.parse(c.payload).jobId).sort(), ['host-a-project-1', 'host-b-project-2']);
 });

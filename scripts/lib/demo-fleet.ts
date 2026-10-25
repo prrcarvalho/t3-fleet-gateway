@@ -190,6 +190,7 @@ async function refresh(baseUrl: string, clientId: string, refreshToken: string):
 export async function startDemoFleet(options: DemoOptions): Promise<DemoFleet> {
   const { scenario } = options;
   const dataDir = mkdtempSync(join(tmpdir(), 't3fg-dashboard-demo-'));
+  const probeState = mkdtempSync(join(tmpdir(), 't3fg-demo-probe-'));
   const fakes = {
     studio: await startFakeT3({ serverVersion: '0.9.4', projectCount: 4 }),
     forge: await startFakeT3({ serverVersion: '0.9.4', projectCount: 3 }),
@@ -205,7 +206,11 @@ export async function startDemoFleet(options: DemoOptions): Promise<DemoFleet> {
   const mcpUrl = `http://127.0.0.1:${door.port}`;
   // Named launches inspect the destination before queueing. The fake projects are not real checkouts, so the
   // demo uses the same synthetic probe the job tests use.
-  const workspaceProbeCommand = [process.execPath, fileURLToPath(new URL('../../test/helpers/workspaceProbe.js', import.meta.url))];
+  // The synthetic probe logs each request under argv[2], and the fake projects have no folder until one is set.
+  const workspaceProbeCommand = [process.execPath, fileURLToPath(new URL('../../test/helpers/workspaceProbe.js', import.meta.url)), probeState];
+  for (const fake of Object.values(fakes)) {
+    for (const project of fake.projects) project.workspaceRoot ??= `/synthetic/${project.id}`;
+  }
   const config = parseConfig({
     publicUrl: mcpUrl,
     listen: { host: '127.0.0.1', port: door.port },
@@ -230,6 +235,7 @@ export async function startDemoFleet(options: DemoOptions): Promise<DemoFleet> {
   const logger = options.logger ?? silentLogger;
   // Client labels are set once the clients exist (ids are random); the config object is the gateway's own.
   const gateway = await startGateway({
+    reachability: { autoStart: false },
     config, dataDir, logger, clock, dashboardDemoLabel: options.badge === undefined ? 'Synthetic demo' : options.badge ?? undefined,
     port: 0, dashboardPort: options.dashboardPort ?? 0, jobEngine: { autoStart: false },
     webhookManagement: { loopbackOnly: true, ...(options.webhookReceiver ? { allowLoopbackHttp: true, attemptTimeoutMs: 1000 } : {}) },
@@ -245,6 +251,7 @@ export async function startDemoFleet(options: DemoOptions): Promise<DemoFleet> {
     await door.close();
     for (const fake of Object.values(fakes)) await fake.close();
     rmSync(dataDir, { recursive: true, force: true });
+    rmSync(probeState, { recursive: true, force: true });
   };
   try {
     for (const id of ['studio', 'forge', 'lab']) await services.registry.enroll(id);

@@ -1,4 +1,3 @@
-import { probeWorkspace } from './workspace.ts';
 import { configuredModel, runtimeModeAllowed, type GatewayConfig, type HostConfig, type ProjectConfig, type RuntimeMode } from '../config.ts';
 import { describeError, GatewayError } from '../errors.ts';
 import type { CatalogService } from '../hosts/catalog.ts';
@@ -7,15 +6,17 @@ import { resolveProjectId } from '../hosts/projects.ts';
 import type { Logger } from '../log.ts';
 import { T3TransportError } from '../t3/client.ts';
 import { isT3NotFound, T3ToolError } from '../t3/results.ts';
-import type { LaunchResult, ThreadRead } from '../t3/schemas.ts';
+import type { LaunchResult, LaunchWorkspaceStrategy, ThreadRead } from '../t3/schemas.ts';
 import { MINUTE, SECOND, type Clock } from '../time.ts';
+import { readPullRequests, pullRequestEvents } from './pullRequests.ts';
 import { readActivity, refreshDelegated, scanActivity } from './activity.ts';
 import { EXCERPT_CHARS, isActiveStatus, observe, threadLinkTarget, type ActivityRead } from './derive.ts';
 import { deliverInterrupt } from './interrupt.ts';
-import { validateSelection, type LaunchSpec, type ModelSelection, type Workspace } from './launchSpec.ts';
-import { jobMarker, markedJobId } from './service.ts';
+import { validateSelection, type LaunchSpec, type ModelSelection } from './launchSpec.ts';
+import { jobMarker } from './service.ts';
 import type { Job, JobChanges, JobStore } from './store.ts';
 import { launchPolicy, mapProjects } from './targets.ts';
+import { probeRequest, resolveWorkspace, runWorkspaceProbe, type ResolvedWorkspace, type WorkspaceIntent } from './workspace.ts';
 
 /** Launches can take a while: T3 prepares the worktree before answering. */
 const LAUNCH_TIMEOUT_MS = 60 * SECOND;
@@ -26,6 +27,22 @@ const IDLE_POLL_MS = MINUTE;
 const MAX_READ_PAGES = 5;
 const READ_PAGE_SIZE = 100;
 const RECENT_RUNS = 5;
+/** What a queued job fails with when the launch plan stored with it cannot be read. Fixed text: the stored text is never repeated. */
+const UNREADABLE_PLAN = "This job's stored launch plan could not be read. Start the work again.";
+/** Times one tick fails unreadable queued jobs and looks again; a ledger with more of them is cleared over the next ticks. */
+const MAX_UNREADABLE_ROUNDS = 10;
+
+/**
+ * Queued jobs the dispatcher looks at beyond the free slots, so a job that cannot launch now (its probe failed, its folder is
+ * busy) does not hide the ones behind it; rounds and probes bound the work one tick does for a host.
+ */
+const DISPATCH_SLACK = 4;
+const DISPATCH_ROUNDS = 4;
+const MAX_PROBES_PER_TICK = 8;
+/** Probe attempts a job gets when the probe cannot reach its host (timeout, ssh exit 255), spaced by the tick interval, doubling. */
+const MAX_PROBE_ATTEMPTS = 3;
+/** An idle job holding its folder for a resume that never showed itself gives it up after this long. */
+const RESUME_GRACE_MS = 10 * MINUTE;
 
 /** Error codes that mean the host as a whole cannot be used right now. */
 const HOST_FAILURES = new Set(['host_unreachable', 't3_timeout', 't3_response_lost', 't3_unauthorized', 'host_not_enrolled']);
@@ -47,19 +64,9 @@ interface FoundThread {
   status?: string;
 }
 
-function foundThread(thread: { threadId: string; title: string; latestRunId: string | null; link: string; status: string }): FoundThread {
+function foundThread(thread: { threadId: string; title: string; latestRunId: string | null; link: string | null; status: string }): FoundThread {
   const { threadId, title, latestRunId, link, status } = thread;
   return { threadId, threadTitle: title, lastRunId: latestRunId, threadLink: threadLinkTarget(link), status };
-}
-
-/** A found thread on which no run ever started; `launchCode` is the launch's own error, if any. */
-function launchNotStarted(launchCode: string | null): { code: string; message: string } {
-  return {
-    code: 'launch_not_started',
-    message:
-      `T3 created the job's thread but started no run on it${launchCode ? ` (the launch answered ${launchCode})` : ''}, ` +
-      'so the task was never delivered. The thread is kept for inspection; start a new job if the work is still needed.',
-  };
 }
 
 function isHostFailure(error: unknown): error is GatewayError {
@@ -70,19 +77,37 @@ function isHostFailure(error: unknown): error is GatewayError {
 export function launchMessage(job: Job): string {
   const workspace = job.launchSpec?.v === 2 && job.launchSpec.workspace.kind === 'scratch'
     ? 'in T3’s internal scratch workspace'
-    : job.launchSpec?.v === 3 && job.launchSpec.workspace.kind === 'root'
-      ? 'in the project’s local checkout'
+    : job.workspaceKind === 'root'
+      ? 'in the project’s own folder'
       : `in a fresh worktree on branch ${job.branch}`;
   return `${job.task}\n\n---\nStarted through t3-fleet-gateway as job ${job.id}, ${workspace}.`;
 }
 
-/** What one launch sends: from the project config (alias-only jobs) or from the job's recorded launch spec. */
+/**
+ * Where a launch puts the thread: a fresh worktree on a branch of the project (from the local base, or from the freshly
+ * fetched remote base), the project's own folder, or T3's own scratch workspace.
+ */
+type Workspace = { kind: 'scratch' } | { kind: 'root' } | { kind: 'worktree'; baseRef: string; branch: string; startFromOrigin: boolean };
+
+function workspaceStrategy(workspace: Exclude<Workspace, { kind: 'scratch' }>): LaunchWorkspaceStrategy {
+  return workspace.kind === 'root'
+    ? { type: 'root' }
+    : { type: 'worktree', baseRef: workspace.baseRef, branch: workspace.branch, startFromOrigin: workspace.startFromOrigin };
+}
+
+/**
+ * What one launch sends: from the project config (alias-only jobs) or from the job's recorded launch spec. For a scratch
+ * launch `projectId` is the configured pin: it is checked against the host's projects before the launch and names the project
+ * a lost launch is looked for in, but it is not sent (T3 files a scratch thread under its own scratch project).
+ */
 interface LaunchPlan {
   projectId: string;
   workspace: Workspace;
   modelSelection: Record<string, unknown> | undefined;
   /** The configured alias whose cached project id a project error should drop, if any. */
   alias: string | null;
+  /** What the dispatcher resolved for a version 3 job (see workspace.ts); the ledger claims the job with it. */
+  resolved?: ResolvedWorkspace;
   /** Added to T3's refusal when it asks for a model this launch did not send. */
   missingModelHint: string;
 }
@@ -100,11 +125,10 @@ function planFromConfig(config: GatewayConfig, project: ProjectConfig, projectId
   };
 }
 
-function planFromSpec(spec: LaunchSpec, hostId: string, branch: string): LaunchPlan {
+function planFromSpec(spec: LaunchSpec, hostId: string, projectId: string, workspace: Workspace): LaunchPlan {
   return {
-    projectId: spec.projectId,
-    workspace: spec.v === 1 ? { kind: 'worktree', baseRef: spec.baseRef, branch, startFromOrigin: false }
-      : spec.workspace.kind === 'worktree' ? { ...spec.workspace, branch, startFromOrigin: spec.v === 3 ? spec.workspace.startFromOrigin : false } : spec.workspace,
+    projectId,
+    workspace,
     modelSelection: spec.model.selection ?? undefined,
     alias: spec.alias,
     missingModelHint: spec.model.selection
@@ -162,8 +186,10 @@ export class JobEngine {
   readonly #inFlight = new Set<string>();
   /** When reconciliation first failed to find a job's thread while its host was reachable. */
   readonly #unconfirmedSince = new Map<string, { hostId: string; since: number }>();
-  readonly #probeRetries = new Map<string, { attempts: number; nextAttemptAt: number }>();
+  readonly #prAttempted = new Map<string, number>();
   readonly #lastPolled = new Map<string, number>();
+  /** Aborted when the engine stops: kills a workspace probe that is still running. */
+  readonly #shutdown = new AbortController();
   #timer: NodeJS.Timeout | undefined;
   #current: Promise<void> = Promise.resolve();
   #next: Promise<void> | undefined;
@@ -191,6 +217,7 @@ export class JobEngine {
   /** Stop ticking and wait for the tick in progress. All job state is already in the database. */
   async stop(): Promise<void> {
     this.#stopped = true;
+    this.#shutdown.abort();
     clearInterval(this.#timer);
     this.#timer = undefined;
     await this.#current;
@@ -221,11 +248,9 @@ export class JobEngine {
 
   /** Drop the in-memory poll times and reconciliation windows of jobs that have finished. */
   #forgetFinished(): void {
-    for (const id of this.#probeRetries.keys()) {
-      if (this.#options.store.get(id)?.state !== 'queued') this.#probeRetries.delete(id);
-    }
-    if (this.#lastPolled.size === 0 && this.#unconfirmedSince.size === 0) return;
+    if (this.#prAttempted.size === 0 && this.#lastPolled.size === 0 && this.#unconfirmedSince.size === 0) return;
     const open = this.#options.store.openJobIds();
+    for (const jobId of this.#prAttempted.keys()) if (!open.has(jobId)) this.#prAttempted.delete(jobId);
     for (const jobId of this.#lastPolled.keys()) if (!open.has(jobId)) this.#lastPolled.delete(jobId);
     for (const jobId of this.#unconfirmedSince.keys()) if (!open.has(jobId)) this.#unconfirmedSince.delete(jobId);
   }
@@ -242,6 +267,7 @@ export class JobEngine {
       const steps = [
         ['reconcile', () => this.#reconcile(host)],
         ['watch', () => this.#watch(host)],
+        ['release', () => this.#releaseStaleHolds(host)],
         ['dispatch', () => this.#dispatch(host)],
       ] as const;
       for (const [step, run] of steps) {
@@ -271,35 +297,62 @@ export class JobEngine {
     this.#options.logger.warn(event, { jobId: job.id, hostId: job.hostId, errorCode: code });
   }
 
-  /** Fill free slots with queued jobs, oldest first. */
+  /**
+   * Fill free slots with queued jobs, oldest first. A job that cannot launch now takes no slot and does not hold up the ones
+   * behind it: it failed, it waits for its probe's next attempt, or it waits for the job that holds its folder (the ledger
+   * leaves such jobs out of the window). One tick looks at a bounded number of jobs and runs a bounded number of probes.
+   */
   async #dispatch(host: HostConfig): Promise<void> {
     const { store, clock } = this.#options;
     const free = host.maxConcurrentJobs - store.slotHolders(host.id);
     if (free <= 0) return;
-    const queued = store.queued(host.id, free + this.#probeRetries.size)
-      .filter((job) => (this.#probeRetries.get(job.id)?.nextAttemptAt ?? 0) <= clock());
-    if (queued.length === 0) return;
-    // A cheap read first: a dead connection (for example after T3 restarted) fails here, where a
-    // retry is safe, instead of making the launch itself ambiguous.
-    await this.#options.registry.client(host.id).environmentRead();
+    const budget = { probes: MAX_PROBES_PER_TICK };
+    const tried = new Set<string>();
     let launched = 0;
-    for (const job of queued) {
-      if (launched >= free) break;
-      const plan = job.launchSpec ? await this.#planFromSpec(host, job, job.launchSpec) : await this.#planFromConfig(job);
-      if (!plan) continue;
-      this.#probeRetries.delete(job.id);
-      // Counted again: while the plan was read from T3, work_adopt may have taken the free slot.
-      const dispatching = store.transition(job.id, {
-        from: ['queued'],
-        slotLimit: host.maxConcurrentJobs,
-        to: 'dispatching',
-        changes: { t3ProjectId: plan.projectId, dispatchStartedAt: clock() },
-      });
-      if (dispatching) {
+    let checked = false;
+    for (let round = 0; round < DISPATCH_ROUNDS && launched < free && budget.probes > 0; round++) {
+      const queued = this.#queuedWithReadablePlans(host, free - launched + DISPATCH_SLACK).filter((job) => !tried.has(job.id));
+      if (queued.length === 0) return;
+      // A cheap read first: a dead connection (for example after T3 restarted) fails here, where a
+      // retry is safe, instead of making the launch itself ambiguous.
+      if (!checked) await this.#options.registry.client(host.id).environmentRead();
+      checked = true;
+      for (const job of queued) {
+        if (launched >= free || budget.probes <= 0 || this.#shutdown.signal.aborted) return;
+        tried.add(job.id);
+        const plan = job.launchSpec ? await this.#planFromSpec(host, job, job.launchSpec, budget) : await this.#planFromConfig(job);
+        if (!plan) continue;
+        const changes = { t3ProjectId: plan.projectId, dispatchStartedAt: clock() };
+        // A resolved workspace is claimed with the ledger (which also takes a root job's folder, or refuses it); the rest transition as before.
+        const claim = plan.resolved
+          ? store.dispatch(job.id, plan.resolved, changes)
+          : (() => {
+              const dispatching = store.transition(job.id, { from: ['queued'], to: 'dispatching', changes });
+              return dispatching ? { kind: 'claimed' as const, job: dispatching } : { kind: 'gone' as const };
+            })();
+        if (claim.kind !== 'claimed') continue;
         launched++;
-        if (!(await this.#launch(dispatching, plan))) return;
+        if (!(await this.#launch(claim.job, plan))) return;
       }
     }
+  }
+
+  /**
+   * The oldest queued jobs, up to `limit`, that can be launched. A job whose stored launch plan cannot be read fails here,
+   * from the ledger alone (a host that is down does not hold it): it is never launched, not even from the configuration as
+   * an alias job, which is what having no plan means. It takes no place in the window, so the jobs behind it still dispatch
+   * in this tick.
+   */
+  #queuedWithReadablePlans(host: HostConfig, limit: number): Job[] {
+    const { store, clock } = this.#options;
+    let queued: Job[] = [];
+    for (let round = 0; round < MAX_UNREADABLE_ROUNDS; round++) {
+      queued = store.queued(host.id, limit, { now: clock() });
+      const unreadable = queued.filter((job) => job.launchSpecUnreadable);
+      if (unreadable.length === 0) break;
+      for (const job of unreadable) this.#failQueued(job, 'database_error', UNREADABLE_PLAN);
+    }
+    return queued.filter((job) => !job.launchSpecUnreadable);
   }
 
   /** The launch of an alias-only job: its project resolved on the host now. Undefined when the job failed instead. */
@@ -328,12 +381,13 @@ export class JobEngine {
    * selection, its capabilities are read now (never from the browse cache): a host that cannot answer
    * leaves the job queued (the host failure propagates); a project that is gone, that a configured alias
    * other than the recorded one now governs (a title renamed since), that no longer accepts work, or a
-   * selection the host no longer advertises fails the job before anything is launched.
+   * selection the host no longer advertises fails the job before anything is launched. A version 3 spec, last, has its
+   * workspace resolved by the host's probe (`#resolveWorkspace`), which may leave the job queued for another try.
    */
-  async #planFromSpec(host: HostConfig, job: Job, spec: LaunchSpec): Promise<LaunchPlan | undefined> {
+  async #planFromSpec(host: HostConfig, job: Job, spec: LaunchSpec, budget: { probes: number }): Promise<LaunchPlan | undefined> {
     const { config, catalog } = this.#options;
-    if (spec.v !== 1 && (spec.hostId !== job.hostId ||
-        (spec.v === 2 && spec.defaultProject !== null && (!host.discovery.enabled || host.defaultProject !== spec.defaultProject)))) {
+    // A host default needs no discovery: only the binding the job was started under must still hold.
+    if (spec.v !== 1 && (spec.hostId !== job.hostId || (spec.v === 2 && spec.defaultProject !== null && host.defaultProject !== spec.defaultProject))) {
       this.#failQueued(job, 'launch_policy_changed', 'The recorded host or default scratch binding changed. Start the work again under the current policy.');
       return undefined;
     }
@@ -345,26 +399,30 @@ export class JobEngine {
       this.#failQueued(job, 'project_not_configured', `Project "${spec.alias}" is no longer configured.`);
       return undefined;
     }
+    let projectId = spec.projectId;
     try {
       const projects = (await catalog.projects(job.hostId, { refresh: true })).value;
-      const mapping = mapProjects(config, job.hostId, projects).get(spec.projectId);
-      if (!mapping) {
-        this.#failQueued(job, 'project_not_found', `Host ${job.hostId} no longer has T3 project ${spec.projectId}.`);
+      const mappings = mapProjects(config, job.hostId, projects);
+      const alias = spec.alias === null ? undefined : config.projects.find((candidate) => candidate.alias === spec.alias);
+      // An alias-only request was recorded without reading T3: its project is found now, through the alias.
+      if (projectId === null) projectId = [...mappings.values()].find((candidate) => alias && candidate.aliases.includes(alias))?.project.id ?? null;
+      const mapping = projectId === null ? undefined : mappings.get(projectId);
+      if (projectId === null || !mapping) {
+        this.#failQueued(job, 'project_not_found', projectId === null ? `Project "${spec.alias}": host ${job.hostId} has no matching T3 project.` : `Host ${job.hostId} no longer has T3 project ${projectId}.`);
         return undefined;
       }
-      const alias = spec.alias === null ? undefined : config.projects.find((candidate) => candidate.alias === spec.alias);
       let changed: string | undefined;
       if (alias) {
         // The agent named the alias: it must still resolve to the recorded project (a title may have moved) and accept work.
-        if (!mapping.aliases.includes(alias)) changed = `project "${alias.alias}" no longer resolves to T3 project ${spec.projectId} on host ${job.hostId}`;
-        else if (alias.workspaceMode !== (spec.v === 1 || spec.v === 3 ? 'worktree' : spec.workspace.kind)) changed = `project "${alias.alias}" changed workspace mode`;
+        if (!mapping.aliases.includes(alias)) changed = `project "${alias.alias}" no longer resolves to T3 project ${projectId} on host ${job.hostId}`;
+        else if (alias.workspaceMode !== (spec.v === 2 ? 'scratch' : 'worktree')) changed = `project "${alias.alias}" changed workspace mode`;
         else if (spec.v !== 1 && alias.runtimeMode !== spec.runtimeMode) changed = `project "${alias.alias}" changed runtime mode`;
         else if (!alias.allowWorkStart) changed = `project "${alias.alias}" no longer accepts work_start`;
       } else {
         const policy = launchPolicy(host, mapping);
         if (policy.kind !== 'discovered') {
           const aliases = policy.kind === 'alias' ? [policy.project.alias] : policy.aliases;
-          changed = `T3 project ${spec.projectId} on host ${job.hostId} is now configured under ${aliases.length === 1 ? 'alias' : 'aliases'} ${aliases.join(', ')}`;
+          changed = `T3 project ${projectId} on host ${job.hostId} is now configured under ${aliases.length === 1 ? 'alias' : 'aliases'} ${aliases.join(', ')}`;
         } else if (!host.discovery.enabled || !host.discovery.allowWorkStart) {
           changed = `host ${job.hostId} no longer accepts work_start into T3 projects without a configured alias`;
         }
@@ -390,39 +448,82 @@ export class JobEngine {
         return undefined;
       }
     }
-    if (spec.v === 3) {
-      try {
-        const current = await probeWorkspace(host, this.#options.registry, spec.projectId, spec.selection, { expectedInspection: spec.inspection });
-        if (current.kind !== spec.inspection.kind || current.root !== spec.inspection.root || current.identity !== spec.inspection.identity) {
-          this.#failQueued(job, 'launch_policy_changed', 'Workspace identity or Git classification changed. Start the work again.');
-          return undefined;
-        }
-      } catch (error) {
-        if (isHostFailure(error)) throw error;
-        const described = describeError(error);
-        if (described.code === 'workspace_probe_unavailable') {
-          const attempts = (this.#probeRetries.get(job.id)?.attempts ?? 0) + 1;
-          if (attempts < 3) {
-            this.#probeRetries.set(job.id, { attempts, nextAttemptAt: this.#options.clock() + this.#intervalMs });
-            this.#options.store.update(job.id, { lastErrorCode: described.code, lastErrorMessage: described.message });
-            return undefined;
-          }
-        }
-        this.#failQueued(job, described.code, described.message);
+    if (spec.v === 1) return planFromSpec(spec, job.hostId, projectId, { kind: 'worktree', baseRef: spec.baseRef, branch: job.branch, startFromOrigin: false });
+    if (spec.v === 2) return planFromSpec(spec, job.hostId, projectId, { kind: 'scratch' });
+    const resolved = await this.#resolveWorkspace(host, job, projectId, spec.workspace, budget);
+    if (!resolved) return undefined;
+    const workspace: Workspace = resolved.kind === 'root' ? { kind: 'root' } : { kind: 'worktree', baseRef: resolved.baseRef, branch: job.branch, startFromOrigin: resolved.startFromOrigin };
+    return { ...planFromSpec(spec, job.hostId, projectId, workspace), resolved };
+  }
+
+  /**
+   * Decide a version 3 job's workspace now, from the folder the project has on its host: the project's `workspaceRoot` is read
+   * from T3 (never stored) and the host's probe inspects it. Undefined means the job did not get one: it failed, it waits for
+   * the probe's next attempt, or the gateway is stopping. A T3 host failure propagates (the job stays queued and the host backs off);
+   * a probe that cannot reach its host costs that job one of a few attempts and nothing else.
+   */
+  async #resolveWorkspace(
+    host: HostConfig,
+    job: Job,
+    projectId: string,
+    intent: WorkspaceIntent,
+    budget: { probes: number },
+  ): Promise<ResolvedWorkspace | undefined> {
+    const { registry, store, clock } = this.#options;
+    const command = host.workspaceProbeCommand;
+    if (!command) {
+      this.#failQueued(job, 'launch_policy_changed', `Host ${host.id} no longer configures a workspaceProbeCommand. Start the work again under the current policy.`);
+      return undefined;
+    }
+    let root: string | null | undefined;
+    try {
+      root = (await registry.client(host.id).listProjects()).find((candidate) => candidate.id === projectId)?.workspaceRoot;
+    } catch (error) {
+      if (isHostFailure(error)) throw error;
+      this.#failQueued(job, 'workspace_probe_failed', `The project list of host ${host.id} could not be read to find the project's folder.`);
+      return undefined;
+    }
+    if (typeof root !== 'string' || !root.startsWith('/')) {
+      this.#failQueued(job, 'workspace_probe_failed', `T3 reports no usable folder for project ${projectId}, so its workspace cannot be chosen.`);
+      return undefined;
+    }
+    budget.probes--;
+    try {
+      const inspection = await runWorkspaceProbe(command, probeRequest(intent, root), { signal: this.#shutdown.signal });
+      return resolveWorkspace(host.id, intent, inspection);
+    } catch (error) {
+      if (this.#shutdown.signal.aborted) return undefined;
+      const described = describeError(error);
+      if (described.code === 'workspace_probe_unavailable' && job.probeAttempts + 1 < MAX_PROBE_ATTEMPTS) {
+        const attempts = job.probeAttempts + 1;
+        store.update(job.id, {
+          probeAttempts: attempts,
+          probeRetryAt: clock() + this.#intervalMs * 2 ** (attempts - 1),
+          lastErrorCode: described.code,
+          lastErrorMessage: described.message,
+        });
         return undefined;
       }
+      this.#failQueued(job, described.code === 'workspace_probe_unavailable' ? described.code : 'workspace_probe_failed', described.message);
+      return undefined;
     }
-    return planFromSpec(spec, job.hostId, job.branch);
+  }
+
+  /** Give up the folders of idle jobs whose resume was never seen to start anything (see `JobStore.releaseStaleHolds`). */
+  #releaseStaleHolds(host: HostConfig): void {
+    const { store, clock, logger } = this.#options;
+    const released = store.releaseStaleHolds(host.id, clock(), RESUME_GRACE_MS);
+    if (released > 0) logger.info('jobs.workspace_root_released', { hostId: host.id, count: released });
   }
 
   #failQueued(job: Job, code: string, message: string): void {
-    this.#probeRetries.delete(job.id);
-    this.#options.store.transition(job.id, {
+    const failed = this.#options.store.transition(job.id, {
       from: ['queued'],
       to: 'failed',
       changes: { lastErrorCode: code, lastErrorMessage: message },
       detail: { reason: code, code },
     });
+    if (failed) this.#options.registry.signals(job.hostId).recordCode('dispatch', code);
   }
 
   /** Launch one job's thread. Returns false when no further job should be launched this tick. */
@@ -431,22 +532,48 @@ export class JobEngine {
     this.#inFlight.add(job.id);
     try {
       let launched: LaunchResult;
+      let attachments;
+      try { attachments = store.launchAttachments(job.id); }
+      catch {
+        store.transition(job.id, { from: ['dispatching'], to: 'failed', changes: {
+          lastErrorCode: 'database_error', lastErrorMessage: "This job's stored attachments could not be read. Start the work again.",
+        }, detail: { reason: 'database_error', code: 'database_error' } });
+        store.clearLaunchAttachments(job.id);
+        return true;
+      }
+      let uploaded;
+      try { uploaded = attachments.length ? await registry.client(job.hostId).uploadAttachments(attachments) : undefined; }
+      catch (error) {
+        // Uploading alone cannot create a thread, even if the upload response is lost.
+        store.transition(job.id, { from: ['dispatching'], to: isHostFailure(error) ? 'queued' : 'failed',
+          changes: { dispatchStartedAt: null, ...(isHostFailure(error) ? {} : {
+            lastErrorCode: 'invalid_argument', lastErrorMessage: "T3 could not accept this job's attachments.",
+          }) }, detail: { reason: 'attachment_upload_failed' } });
+        store.transition(job.id, { from: ['cancel_requested'], to: 'cancelled', detail: { reason: 'cancelled_before_launch' } });
+        if (isHostFailure(error)) throw error;
+        return true;
+      }
+      if (store.require(job.id).state === 'cancel_requested') {
+        store.transition(job.id, { from: ['cancel_requested'], to: 'cancelled', detail: { reason: 'cancelled_before_launch' } });
+        return true;
+      }
       try {
         launched = await registry.client(job.hostId).launchThread(
           {
-            projectId: plan.projectId,
             title: job.title,
-            workspaceStrategy: plan.workspace.kind !== 'worktree'
-              ? { type: 'root' }
-              : { type: 'worktree', baseRef: plan.workspace.baseRef, branch: plan.workspace.branch, startFromOrigin: plan.workspace.startFromOrigin },
             runtimeMode: job.runtimeMode as RuntimeMode,
             ...(plan.modelSelection ? { modelSelection: plan.modelSelection } : {}),
             message: launchMessage(job),
+            ...(uploaded ? { attachments: uploaded } : {}),
+            ...(plan.workspace.kind === 'scratch'
+              ? { scratch: true as const }
+              : { projectId: plan.projectId, workspaceStrategy: workspaceStrategy(plan.workspace) }),
           },
           { timeoutMs: this.#launchTimeoutMs },
         );
       } catch (error) {
-        if (error instanceof T3ToolError) return await this.#launchRefused(job, plan, error);
+        if (error instanceof T3ToolError) return await this.#launchRefused(job, plan,
+          uploaded ? new T3ToolError(error.tool, error.t3Code, 'T3 could not accept the attached files.') : error);
         if (error instanceof T3TransportError && error.delivery === 'not_delivered') {
           store.transition(job.id, { from: ['dispatching'], to: 'queued', changes: { dispatchStartedAt: null }, detail: { reason: 'host_unreachable', code: error.code } });
           store.transition(job.id, { from: ['cancel_requested'], to: 'cancelled', detail: { reason: 'cancelled_before_launch' } });
@@ -465,10 +592,15 @@ export class JobEngine {
         if (isHostFailure(error)) throw error;
         return true;
       }
+      // The thread exists whichever project T3 filed it under, so the job follows it; only the warning says the pin was wrong.
+      if (plan.workspace.kind === 'scratch' && launched.projectId !== plan.projectId) {
+        this.#options.logger.warn('job.scratch_project_mismatch', { jobId: job.id, hostId: job.hostId });
+      }
       const thread = { threadId: launched.threadId, threadTitle: job.title, lastRunId: launched.runId, threadLink: threadLinkTarget(launched.link) };
       await this.#attach(job.id, thread, 'launched', null);
       return true;
     } finally {
+      if (!['queued', 'dispatching'].includes(store.require(job.id).state)) store.clearLaunchAttachments(job.id);
       this.#inFlight.delete(job.id);
     }
   }
@@ -563,7 +695,7 @@ export class JobEngine {
     const client = this.#options.registry.client(hostId);
     const marker = jobMarker(jobId);
     // The marker ends the title; one merely mentioned elsewhere in a title is someone else's thread.
-    const carriesMarker = (title: string) => markedJobId(title) === jobId;
+    const carriesMarker = (title: string) => title.trim().endsWith(marker);
     // T3 lists unsettled threads unless asked for settled ones, and a job's thread may be settled already.
     for (const settled of [false, true]) {
       const listed = await client.listThreads({ projectId, titleContains: marker, limit: 10, ...(settled ? { settled } : {}) });
@@ -587,12 +719,17 @@ export class JobEngine {
 
   /** Observe every job that has a thread and is not finished; idle jobs less often. */
   async #watch(host: HostConfig): Promise<void> {
+    const prBudget = { remaining: 4 };
     const { store, clock } = this.#options;
-    for (const job of store.onHost(host.id, ['running', 'needs_input', 'cancel_requested', 'idle'])) {
+    // Oldest optional lookup first: the per-tick budget must not starve later idle jobs.
+    const jobs = store.onHost(host.id, ['running', 'needs_input', 'cancel_requested', 'idle']);
+    jobs.sort((a, b) => (this.#prAttempted.get(a.id) ?? a.pullRequestsCheckedAt ?? -Infinity) -
+      (this.#prAttempted.get(b.id) ?? b.pullRequestsCheckedAt ?? -Infinity));
+    for (const job of jobs) {
       if (job.threadId === null) continue;
       if (job.state === 'idle' && clock() - (this.#lastPolled.get(job.id) ?? 0) < IDLE_POLL_MS) continue;
       try {
-        await this.#observeJob(job, job.threadId);
+        await this.#observeJob(job, job.threadId, prBudget);
       } catch (error) {
         this.#jobFailed(job, error, 'jobs.watch_failed');
       }
@@ -600,7 +737,7 @@ export class JobEngine {
     }
   }
 
-  async #observeJob(job: Job, threadId: string): Promise<void> {
+  async #observeJob(job: Job, threadId: string, prBudget: { remaining: number }): Promise<void> {
     const { store, registry, logger, clock } = this.#options;
     const client = registry.client(job.hostId);
     let read: ThreadRead;
@@ -615,6 +752,7 @@ export class JobEngine {
     } catch (error) {
       if (!(error instanceof T3ToolError)) throw error;
       logger.warn('jobs.watch_failed', { jobId: job.id, hostId: job.hostId, errorCode: error.t3Code });
+      // method_not_found matches /not_found/ but never reached the tool: the thread is still there.
       if (isT3NotFound(error)) {
         store.transition(job.id, {
           from: [job.state],
@@ -627,7 +765,31 @@ export class JobEngine {
       }
       return;
     }
+    // Optional metadata must never change host health or suppress normal state observation.
+    const prChanges: JobChanges = {};
+    let prEvents: ReturnType<typeof pullRequestEvents> = [];
+    const attempted = this.#prAttempted.get(job.id) ?? job.pullRequestsCheckedAt;
+    if (prBudget.remaining > 0 && (attempted === null || clock() - attempted >= MINUTE)) {
+      this.#prAttempted.set(job.id, clock());
+      prBudget.remaining--;
+      try {
+        const value = Object.hasOwn(read.thread, 'pullRequests') ? read.thread.pullRequests
+          : (await client.listThreadPullRequests(threadId)).pullRequests;
+        // The tracked list (bounded), or null when the answer holds nothing readable: unknown, so the last snapshot and its freshness stay.
+        const prs = readPullRequests(value);
+        if (prs !== null) {
+          prChanges.pullRequests = prs;
+          prChanges.pullRequestsCheckedAt = clock();
+          prEvents = pullRequestEvents(job.pullRequests, prs);
+        }
+      } catch { /* Missing tool, malformed output or transport error: retain the last known snapshot. */ }
+    }
     const seen = observe(job, read, questions, activity);
+    // A later turn may start and finish entirely between idle polls. A repeated failed snapshot
+    // is not recovery, nor is metadata activity (PRs, settlement) on the same failed run.
+    const recovered = job.lastErrorCode === 't3_run_failed' && !seen.errorCode &&
+      (seen.state === 'running' || seen.state === 'needs_input' || seen.anotherTurnFinished);
+    const recoveryEvents = recovered ? [{ type: 'job_recovered', detail: { reason: 'worker_resumed' } }] : [];
     // An idle job's delegated work ended (finished, failed or cancelled) and no turn followed: T3 starts
     // one by itself when a child finishes, but not always (a failed or cancelled child, say), and the job
     // would otherwise sit waiting with nothing to tell the agent.
@@ -635,6 +797,7 @@ export class JobEngine {
     const hasDelegated = seen.delegatedWork.length > 0 || seen.delegatedUntracked > 0;
     const delegatedEnded = job.state === 'idle' && seen.state === 'idle' && hadDelegated && !hasDelegated && !seen.anotherTurnFinished;
     const changes: JobChanges = {
+      ...prChanges,
       pendingRequestIds: seen.pendingRequestIds,
       delegatedWork: seen.delegatedWork,
       delegatedUntracked: seen.delegatedUntracked,
@@ -649,7 +812,7 @@ export class JobEngine {
       ...(seen.errorCode
         ? { lastErrorCode: seen.errorCode, lastErrorMessage: 'The T3 run failed. Open the thread in T3 for details.' }
         : // A valid observation clears a prior shape error; a failed run clears only once a new turn runs.
-          job.lastErrorCode === 't3_invalid_response' || (seen.state === 'running' && job.lastErrorCode === 't3_run_failed')
+          job.lastErrorCode === 't3_invalid_response' || recovered
           ? { lastErrorCode: null, lastErrorMessage: null }
           : {}),
     };
@@ -660,6 +823,8 @@ export class JobEngine {
         from: [job.state], to: job.state, expected: job, changes,
         turnRunId: read.thread.activeRunId ?? read.thread.latestRunId,
         events: [
+          ...prEvents,
+          ...recoveryEvents,
           ...(seen.anotherTurnFinished ? [{ type: 'turn_finished', detail: { reason: seen.reason } }] : []),
           ...(delegatedEnded ? [{ type: 'delegated_work_ended', detail: { reason: 'no_turn_started' } }] : []),
         ],
@@ -677,6 +842,7 @@ export class JobEngine {
       expected: job,
       turnRunId: read.thread.activeRunId ?? read.thread.latestRunId,
       changes,
+      events: [...prEvents, ...recoveryEvents],
       detail: { reason: seen.reason, ...(seen.errorCode ? { code: seen.errorCode } : {}) },
     });
   }
@@ -720,23 +886,31 @@ export class JobEngine {
   }
 
   /**
-   * Record the job's thread and move it to running, unless another open job already follows the thread (it took the
-   * thread over with jobs adopt, or with work_adopt after a person removed the marker from its title; see
-   * `JobStore.attachThread`). A job cancelled while its launch was in flight or unconfirmed keeps cancel_requested, and
-   * its thread is interrupted now. A found thread on which no run ever started never received the task: the job fails
-   * with `launch_not_started` (`launchCode` is the launch's own error, if any), keeping the thread so it can be inspected.
+   * Record the job's thread and move it to running. A job cancelled while its launch was in flight
+   * or unconfirmed keeps cancel_requested, and its thread is interrupted now. A found thread on
+   * which no run ever started never received the task: the job fails with `launch_not_started`
+   * (`launchCode` is the launch's own error, if any), keeping the thread so it can be inspected.
    */
   async #attach(jobId: string, thread: FoundThread, via: 'launched' | 'reconciled', launchCode: string | null): Promise<void> {
     const { store, registry } = this.#options;
     const { threadLink, status, ...rest } = thread;
     const notStarted = status !== undefined && thread.lastRunId === null && !isActiveStatus(status);
+    if (!notStarted) registry.signals(store.require(jobId).hostId).record('dispatch');
     const job = store.attachThread(jobId, {
-      thread: { ...rest, ...(threadLink ? { threadLink } : {}) },
+      thread: { ...rest, ...(threadLink ? { threadLink } : {}), ...(notStarted ? {} : { pullRequests: [] }) },
       via,
-      gatewayTurn: via === 'launched' && thread.lastRunId !== null ? { runId: thread.lastRunId, clientId: store.require(jobId).clientId } : undefined,
-      failure: notStarted ? launchNotStarted(launchCode) : undefined,
+      gatewayTurn: via === 'launched' && thread.lastRunId !== null
+        ? { runId: thread.lastRunId, clientId: store.require(jobId).clientId } : undefined,
+      failure: notStarted ? {
+        code: 'launch_not_started',
+        message:
+          `T3 created the job's thread but started no run on it${launchCode ? ` (the launch answered ${launchCode})` : ''}, ` +
+          'so the task was never delivered. The thread is kept for inspection; start a new job if the work is still needed.',
+      } : undefined,
     });
-    if (job?.state === 'cancel_requested') await this.#interrupt(jobId, job.hostId, { threadId: thread.threadId, runId: thread.lastRunId }, registry);
+    if (job?.state === 'cancel_requested') {
+      await this.#interrupt(jobId, job.hostId, { threadId: thread.threadId, runId: thread.lastRunId }, registry);
+    }
   }
 
   /** Deliver (or re-deliver) a cancel_requested job's interrupt for one run. T3 deduplicates repeats per run. */

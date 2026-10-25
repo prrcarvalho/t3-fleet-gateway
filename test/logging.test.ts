@@ -164,30 +164,84 @@ test('no T3 project name, model, option or constraint from discovery ever appear
   for (const value of [...Object.values(content), 'Synthetic-wrong-value-1c9e']) assert.equal(events.includes(value), false, 'content leaked into events');
 });
 
-test('no native read arguments, results, schemas or adopted thread content ever appear in the logs or events', async (t) => {
-  const { fake, gw, agent, tick } = await startJobHarness(t);
+test('scratch work leaks no task, title, T3 project name or catalog content through drift, a lost launch or a refused replay', async (t) => {
   const content = {
-    message: 'Synthetic-app-thread-message-4b7e',
-    title: 'Synthetic-app-thread-title-e19c',
-    query: 'Synthetic-search-argument-77d0',
-    refused: 'Synthetic-refused-argument-a5c1',
-    adoptTitle: 'Synthetic-adopted-job-title-0d4f',
+    task: 'Synthetic-scratch-task-55c1',
+    title: 'Synthetic-scratch-title-8d02',
+    project: 'Synthetic-scratch-project-name-1be7',
+    model: 'synthetic-scratch-model-a47c',
+    optionId: 'synthetic-scratch-option-3f9d',
+    choice: 'synthetic-scratch-choice-62e8',
+    constraint: 'Synthetic-scratch-constraint-90b4',
   };
-  const { threadId } = fake.startInApp({ projectId: 'project-1', title: content.title, message: content.message, runtimeMode: 'auto' });
-  await agent.call('fleet_t3_tools', { host: 'main' });
-  const read = await agent.call<{ result: unknown }>('fleet_t3_call', { host: 'main', tool: 't3_thread_read', arguments: { threadId } });
-  assert.ok(JSON.stringify(read.result).includes(content.message), 'the agent got the thread content');
-  await agent.call('fleet_t3_call', { host: 'main', tool: 't3_thread_search', arguments: { query: content.query, projectId: 'project-1' } });
-  await agent.callError('fleet_t3_call', { host: 'main', tool: 't3_thread_send', arguments: { threadId, message: content.refused } });
-  await agent.callError('fleet_t3_call', { host: 'main', tool: 't3_thread_read', arguments: { threadId: content.refused } });
+  const selection = { instanceId: 'synthetic-provider', model: content.model, options: { [content.optionId]: content.choice } };
+  const h = await startJobHarness(t, {
+    maxConcurrentJobs: 4,
+    host: { access: 'full-access', discovery: { enabled: true }, defaultProject: 'pilot' },
+    pilot: { workspaceMode: 'scratch', runtimeMode: 'full-access' },
+  });
+  const { fake, gw, agent, tick } = h;
+  fake.projects[0]!.title = content.project;
+  fake.providers = [{
+    providerInstanceId: 'synthetic-provider', driverKind: 'synthetic', displayName: 'Synthetic', canRunChildTask: true, canRunCrossProviderChildTask: false,
+    constraints: [content.constraint],
+    models: [{ id: content.model, label: null, options: [{ id: content.optionId, label: 'Synthetic', type: 'select', options: [{ id: content.choice, label: 'Synthetic' }] }] }],
+  }];
+  const start = (requestId: string, extra: Record<string, unknown> = {}) =>
+    agent.call<{ job: { jobId: string } }>('work_start', { target: { host: 'main' }, task: content.task, title: content.title, requestId, ...extra });
 
-  await agent.call('work_adopt', { host: 'main', threadId, requestId: 'adopt-log', title: content.adoptTitle });
-  fake.finishTurn(threadId, content.message);
+  // A scratch job with an explicit selection, one reached by its id, and a mismatched filing: all launch.
+  const selected = await start('selected', { modelSelection: selection });
+  const byId = await start('by-id', { target: { host: 'main', projectId: 'project-1' } });
   await tick();
+  fake.scratchProjectId = 'project-2';
+  const mismatched = await start('mismatch');
+  await tick();
+  fake.scratchProjectId = 'project-1';
 
-  assert.ok(gw.logs.some((line) => line.includes('"tool":"fleet_t3_call"') && line.includes('"errorCode":"tool_not_allowed"')));
-  assert.ok(gw.logs.some((line) => line.includes('"event":"job.adopted"')));
-  assertNotLogged(gw, [...Object.values(content), 'maxCharsPerItem']);
-  const events = JSON.stringify(gw.services.db.prepare('SELECT * FROM job_events').all());
-  for (const value of Object.values(content)) assert.equal(events.includes(value), false, 'content leaked into events');
+  // Drift while queued: the job fails with launch_policy_changed and its fixed text.
+  const drifted = await start('drift');
+  gw.services.config.projects[0]!.runtimeMode = 'auto';
+  await tick();
+  gw.services.config.projects[0]!.runtimeMode = 'full-access';
+  assert.equal(gw.services.jobs.store.require(drifted.job.jobId).lastErrorCode, 'launch_policy_changed');
+
+  // A lost launch response: the job is unknown, then found by its marker in the pinned project.
+  fake.dropResponseOnce.add('t3_thread_launch');
+  const lost = await start('lost');
+  await tick();
+  assert.equal(gw.services.jobs.store.require(lost.job.jobId).state, 'unknown');
+  await h.tickAfter(60_000);
+  assert.equal(gw.services.jobs.store.require(lost.job.jobId).state, 'running');
+
+  // A replay the caller may not operate, and a conflicting reuse of a request id.
+  const narrowed = { clientId: agent.clientId, scopes: ['host:other:read', 'host:other:operate'] as const };
+  await assert.rejects(gw.services.jobs.start(narrowed, { target: { host: 'main' }, task: content.task, title: content.title, requestId: 'selected', modelSelection: selection }), { code: 'insufficient_scope' });
+  assert.equal((await agent.callError('work_start', { target: { host: 'main' }, task: `${content.task} changed`, requestId: 'selected', modelSelection: selection })).code, 'request_id_conflict');
+
+  for (const { job } of [selected, byId, mismatched, drifted, lost]) {
+    await agent.call('work_status', { jobId: job.jobId });
+  }
+  await agent.call('work_feed', {});
+  await agent.call('work_list', {});
+  const events = ['job.created', 'job.scratch_project_mismatch'].map((event) => gw.logs.some((line) => line.includes(`"event":"${event}"`)));
+  assert.deepEqual(events, [true, true]);
+  assertNotLogged(gw, Object.values(content));
+  const stored = JSON.stringify(gw.services.db.prepare('SELECT detail FROM job_events').all());
+  for (const value of [content.task, content.title, content.project, content.constraint]) assert.equal(stored.includes(value), false, `content leaked into events: ${value}`);
+});
+
+test('no native read arguments, results or schemas appear in the logs', async (t) => {
+  const message = 'Synthetic-native-message-7c31';
+  const h = await startJobHarness(t);
+  const { threadId } = h.fake.startInApp({ projectId: 'project-1', title: 'Synthetic app thread', message });
+  const listed = await h.agent.call<{ tools: { name: string; inputSchema: unknown }[] }>('fleet_t3_tools', { host: 'main' });
+  const readTool = listed.tools.find((tool) => tool.name === 't3_thread_read');
+  assert.ok(readTool);
+  const read = await h.agent.call<{ result: { items: { text: string }[] } }>('fleet_t3_call', {
+    host: 'main', tool: 't3_thread_read', arguments: { threadId },
+  });
+  assert.equal(read.result.items.at(-1)?.text, message);
+  assert.ok(h.gw.logs.some((line) => line.includes('"tool":"fleet_t3_call"') && line.includes('"outcome":"ok"')));
+  assertNotLogged(h.gw, [message, JSON.stringify(readTool.inputSchema)]);
 });
